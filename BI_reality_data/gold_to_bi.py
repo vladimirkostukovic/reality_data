@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import json
 import logging
@@ -26,7 +25,6 @@ db_name = cfg.get("dbname") or cfg.get("DB")
 DB_URL  = f"postgresql+psycopg2://{db_user}:{db_pwd}@{db_host}:{db_port}/{db_name}"
 engine  = create_engine(DB_URL, pool_pre_ping=True, connect_args={"connect_timeout": 10})
 
-# BI схема
 BI_SCHEMA = "bi_reality_data"
 
 # ---------- UTILS ----------
@@ -49,7 +47,6 @@ def count_rows(conn, schema: str, table: str) -> int:
     return int(conn.execute(text(f"SELECT COUNT(*) FROM {fq(schema, table)}")).scalar() or 0)
 
 def publish_table(conn, schema: str, target: str, stage: str):
-    # Публикуем без *_old
     conn.execute(text(f'DROP TABLE IF EXISTS {fq(schema, target)}'))
     conn.execute(text(f'ALTER TABLE {fq(schema, stage)} RENAME TO "{target}"'))
     conn.execute(text(f'ANALYZE {fq(schema, target)}'))
@@ -232,7 +229,6 @@ def rebuild_dim_object(conn) -> int:
     return count_rows(conn, BI_SCHEMA, "dim_object")
 
 # ---------- FACTS: ACTIVE / CLOSED ----------
-# Нормализованные выражения для join к dim_geo
 G_JOIN_REGION = "lower(regexp_replace(COALESCE(r.norm_district,'Neznámý kraj'),  '\\\\s+',' ','g'))"
 G_JOIN_DIST   = "lower(regexp_replace(COALESCE(r.norm_okres,'Neznámý okres'),    '\\\\s+',' ','g'))"
 G_JOIN_CITY   = "lower(regexp_replace(COALESCE(r.norm_city,''),                  '\\\\s+',' ','g'))"
@@ -446,11 +442,6 @@ def rebuild_split_closed(conn) -> Dict[str, int]:
 
 # ---------- SANITY CHECKS ----------
 def run_sanity_checks(conn) -> Tuple[bool, Dict[str, int]]:
-    """
-    1) DISTINCT object_id в gold.totalized = DISTINCT в фактах (объединение active∪closed).
-    2) Нет неизвестных deal_type.
-    3) Сумма строк в сплитах совпадает с количеством строк по белому списку в фактах.
-    """
     stats: Dict[str, int] = {}
 
     totalized_distinct = int(conn.execute(text("""
@@ -552,7 +543,7 @@ def run_sanity_checks(conn) -> Tuple[bool, Dict[str, int]]:
 
     return True, stats
 
-# ---------- PRICE EVENTS (заглушка) ----------
+# ---------- PRICE EVENTS ----------
 def rebuild_price_change_events(conn) -> int:
     stage = "fact_object_price_events__stage"
     conn.execute(text(f'DROP TABLE IF EXISTS {fq(BI_SCHEMA, stage)}'))
