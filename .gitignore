@@ -1,0 +1,17 @@
+# virtualenv
+.venv/
+__pycache__/
+*.pyc
+
+# local data
+logs/
+batch_inputs/
+batch_outputs/
+batch_errors/
+
+# config & credentials
+config.json
+
+# OS noise
+.DS_Store
+.idea/
