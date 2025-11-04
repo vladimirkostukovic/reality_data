@@ -32,14 +32,13 @@ with open(PROJECT_ROOT / "config.json", "r", encoding="utf-8") as f:
 DB_URL = f"postgresql+psycopg2://{cfg['USER']}:{cfg['PWD']}@{cfg['HOST']}:{cfg['PORT']}/{cfg['DB']}"
 engine = create_engine(DB_URL, pool_pre_ping=True)
 
-# Каталог для сохранения изображений
+# images catalogue
 _base = Path(__file__).resolve().parent
 _cfg_dir = Path(cfg.get("local_image_dir", "images"))
 LOCAL_IMAGE_DIR = str(_cfg_dir if _cfg_dir.is_absolute() else _base / _cfg_dir)
 os.makedirs(LOCAL_IMAGE_DIR, exist_ok=True)
 log.info("Saving images to: %s", LOCAL_IMAGE_DIR)
 
-# --- Настройки ---
 BATCH_SIZE = int(os.getenv("IMG_BATCH_SIZE", "100"))
 MAX_WORKERS = int(os.getenv("IMG_MAX_WORKERS", "2"))
 
@@ -77,7 +76,6 @@ def _build_session(pool_maxsize: int) -> requests.Session:
     sess.mount("https://", adapter)
     sess.headers.update(COMMON_HEADERS)
 
-    # Прогрев cookie (иначе sdn.cz даёт 401)
     for warm in ("https://www.sreality.cz/", "https://www.bezrealitky.cz/"):
         try:
             sess.get(warm, timeout=10)
@@ -145,7 +143,7 @@ def _download_one(task, local_dir, session: requests.Session):
         r = session.get(url, timeout=20, headers=headers, stream=True, allow_redirects=True)
         code = r.status_code
 
-        # Unauthorized/Forbidden/Not Found — пробуем без query
+        # Unauthorized/Forbidden/Not Found
         if code in (401, 403, 404) and "?" in url:
             url2 = _strip_query(url)
             r2 = session.get(url2, timeout=20, headers=headers, stream=True, allow_redirects=True)

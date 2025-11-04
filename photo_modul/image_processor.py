@@ -28,7 +28,6 @@ with open(PROJECT_ROOT / "config.json", "r", encoding="utf-8") as f:
 DB_URL = f"postgresql+psycopg2://{cfg['USER']}:{cfg['PWD']}@{cfg['HOST']}:{cfg['PORT']}/{cfg['DB']}"
 engine = create_engine(DB_URL, pool_pre_ping=True)
 
-# Всегда работаем с папкой рядом со скриптом, если в конфиге не абсолютный путь
 _base = Path(__file__).resolve().parent
 _cfg_dir = Path(cfg.get("local_image_dir", "images"))
 IMAGE_DIR = (_cfg_dir if _cfg_dir.is_absolute() else (_base / _cfg_dir)).resolve()
@@ -111,7 +110,6 @@ def _remove_files(batch):
     for rec in batch:
         try:
             p = (base / rec['filename']).resolve()
-            # защита от выходов выше каталога
             if not str(p).startswith(str(base) + os.sep):
                 continue
             if p.exists():

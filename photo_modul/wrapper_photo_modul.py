@@ -7,7 +7,6 @@ from pathlib import Path
 from importlib import import_module
 from datetime import datetime
 
-# Логи только в stderr, stdout чистый JSON отчета
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -16,14 +15,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("Wrapper")
 
-# Базовый порядок шагов
+
 DEFAULT_STEPS = [
     ("downloader", "image_downloader", "main"),
     ("processor",  "image_processor",  "main"),
     ("compare",    "phash_compare",    "main"),
 ]
 
-# cleanup выполняем только 1-го числа месяца
+# cleanup
 CLEANUP_STEP = ("cleanup", "cleanup_image_downloaded", "main")
 
 def run_step(alias: str, module_name: str, func_name: str) -> dict:
@@ -49,7 +48,6 @@ def normalize_steps(order_csv: str | None) -> list[tuple[str, str, str]]:
             seen.add(a)
         steps = result or DEFAULT_STEPS
 
-    # если сегодня первое число месяца — добавить cleanup
     today = datetime.now()
     if today.day == 1:
         steps.append(CLEANUP_STEP)

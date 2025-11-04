@@ -180,11 +180,9 @@ def main():
                          compared, total_buckets, inserted, total_found)
             gc.collect()
 
-    # Финальный вброс, если что-то осталось (на самом деле уже вставлено по месту)
     log.info("Done. Compared %s buckets, inserted %s duplicates, total found: %s",
              compared, inserted, total_found)
 
-    # Отметить все новые как старые
     with engine.begin() as conn:
         conn.execute(text("UPDATE image_hashes SET is_old = true WHERE is_old = false"))
     log.info("All processed new hashes are now marked as old.")
