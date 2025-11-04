@@ -1,0 +1,17 @@
+# Core
+pandas>=2.1.0
+numpy>=1.26.0
+SQLAlchemy>=2.0.0
+psycopg2-binary>=2.9.9
+
+# Data processing
+rapidfuzz>=3.6.1
+Pillow>=10.0.0
+
+# Logging & utilities
+requests>=2.31.0
+python-dotenv>=1.0.1
+
+
+openpyxl>=3.1.2
+tqdm>=4.66.1
