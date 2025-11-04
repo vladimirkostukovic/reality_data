@@ -25,7 +25,7 @@ POST_STEPS: List[str] = [
     "geo_garbage.py",
     "geo_garbage_openai.py",
     "geo_garbage_to_sumgeo.py",
-    "geo_to_subset.py"
+    "geo_to_subset.py",
     "praha_match.py",
     "stredo_match.py",
     "duplicate_internal.py",

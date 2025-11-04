@@ -621,7 +621,6 @@ def main():
         "note": note,
     }
     print(json.dumps(short, ensure_ascii=False, separators=(",", ":")))
-==
     _upsert_stats(
         module="idnes_pipeline",
         status=("ok" if overall_ok else "error"),

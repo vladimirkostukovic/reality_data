@@ -181,7 +181,7 @@ def extract_latest_bz_photos() -> None:
                 res = conn.execute(insert_sql)
                 inserted = res.rowcount or 0
         emit("insert", inserted=inserted, dry_run=DRY_RUN)
-а
+
         with engine.begin() as conn:
             total_src = conn.execute(text(f'SELECT COUNT(*) FROM public."{table_today}"')).scalar_one()
             total_dst = conn.execute(text('SELECT COUNT(*) FROM public.bezrealitky_photo')).scalar_one()
