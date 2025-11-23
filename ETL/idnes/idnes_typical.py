@@ -1,4 +1,6 @@
-
+#Script processes the latest idnes_* snapshot, normalizes records, inserts missing listings into
+# idnes_typical, updates existing ones, archives disappeared IDs, enforces a unique site_id index,
+# removes duplicates, and outputs a clean standardized JSON summary for the orchestrator.
 from __future__ import annotations
 
 import sys
@@ -40,10 +42,9 @@ DRY_RUN = bool(cfg.get("DRY_RUN", False))
 
 def _make_db_url() -> str:
     try:
-        import psycopg  # noqa: F401
+        import psycopg  # noqa
         return f"postgresql+psycopg://{DB_USER}:{DB_PWD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
     except ModuleNotFoundError:
-        import psycopg2  # noqa: F401
         return f"postgresql+psycopg2://{DB_USER}:{DB_PWD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 engine = create_engine(_make_db_url(), pool_pre_ping=True, connect_args={"connect_timeout": 10})
@@ -63,15 +64,18 @@ def _get_latest_idnes_table() -> str | None:
     """)
     with engine.begin() as conn:
         rows = [r[0] for r in conn.execute(sql)]
+
     if not rows:
         return None
+
     def key(t: str):
-        d = t[-8:]  # DDMMYYYY
+        d = t[-8:]
         return int(d[4:]), int(d[2:4]), int(d[:2])
+
     return sorted(rows, key=key)[-1]
 
 def _date_from_tbl(tbl: str) -> date:
-    d = tbl[-8:]  # DDMMYYYY
+    d = tbl[-8:]
     return date(int(d[4:]), int(d[2:4]), int(d[:2]))
 
 def _transform(df: pd.DataFrame) -> pd.DataFrame:
@@ -80,7 +84,7 @@ def _transform(df: pd.DataFrame) -> pd.DataFrame:
     out["added_date"]    = pd.to_datetime(df["added_date"], errors="coerce")
     out["archived_date"] = pd.to_datetime(df["archived_date"], errors="coerce")
     out["available"]     = out["archived_date"].isna()
-    out["source_id"]     = 3  # idnes
+    out["source_id"]     = 3
 
     raw = df.get("category_name", "").astype(str).str.lower()
     out["category_value"] = raw.map({"apartments": 1, "houses": 2, "land": 3}).fillna(5).astype("Int64")
@@ -92,7 +96,10 @@ def _transform(df: pd.DataFrame) -> pd.DataFrame:
 
     price_series = df.get("price_czk", df.get("price"))
     out["price"] = pd.to_numeric(
-        price_series.astype(str).str.replace("\xa0", "", regex=False).str.replace(" ", "", regex=False).str.replace(",", ".", regex=False),
+        price_series.astype(str)
+        .str.replace("\xa0", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace(",", ".", regex=False),
         errors="coerce"
     )
 
@@ -114,9 +121,10 @@ def _transform(df: pd.DataFrame) -> pd.DataFrame:
     out = out.astype(object)
     for c in out.columns:
         out[c] = out[c].where(pd.notnull(out[c]), None)
+
     return out
 
-# --- site_id  ON CONFLICT ---
+
 def _has_unique_site_id(conn) -> bool:
     q = text("""
         SELECT 1
@@ -133,14 +141,18 @@ def _has_unique_site_id(conn) -> bool:
     """)
     return conn.execute(q).first() is not None
 
+
 def _count_dupes_site_id(conn) -> int:
     q = text("""
         SELECT COUNT(*) FROM (
-          SELECT site_id FROM public."idnes_typical"
-          GROUP BY site_id HAVING COUNT(*) > 1
+          SELECT site_id
+          FROM public."idnes_typical"
+          GROUP BY site_id
+          HAVING COUNT(*) > 1
         ) s
     """)
     return int(conn.execute(q).scalar_one())
+
 
 def _dedupe_site_id(conn) -> int:
     q = text("""
@@ -148,16 +160,20 @@ def _dedupe_site_id(conn) -> int:
           SELECT ctid,
                  ROW_NUMBER() OVER (
                    PARTITION BY site_id
-                   ORDER BY archived_date NULLS FIRST, added_date DESC NULLS LAST, ctid
+                   ORDER BY archived_date NULLS FIRST,
+                            added_date DESC NULLS LAST,
+                            ctid
                  ) AS rn
           FROM public."idnes_typical"
         )
         DELETE FROM public."idnes_typical" t
         USING ranked r
-        WHERE t.ctid = r.ctid AND r.rn > 1
+        WHERE t.ctid = r.ctid
+          AND r.rn > 1
         RETURNING 1
     """)
     return len(conn.execute(q).fetchall())
+
 
 def _ensure_unique_index() -> int:
     if DRY_RUN:
@@ -166,31 +182,33 @@ def _ensure_unique_index() -> int:
     with engine.begin() as conn:
         conn.execute(text("SET LOCAL lock_timeout = '5s'"))
         conn.execute(text("SET LOCAL statement_timeout = '10min'"))
+
         if not _has_unique_site_id(conn):
             dupes = _count_dupes_site_id(conn)
+
             if dupes > 0:
                 removed = _dedupe_site_id(conn)
-                log.warning(f"[DEDUP] idnes_typical: removed {removed} duplicate rows on site_id")
+                log.warning(f"[DEDUP] removed {removed} duplicates")
+
             conn.execute(text("""
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_idnes_typical_site_id
                 ON public."idnes_typical"(site_id)
             """))
+
     return removed
 
 # ========== MAIN ==========
 def main():
     t0 = datetime.now()
+    snapshot_date = None
+
     try:
         emit("start", stage="idnes_typical", dry_run=DRY_RUN)
 
         latest_tbl = _get_latest_idnes_table()
         if not latest_tbl:
-            msg = "No idnes_* snapshot tables found"
-            log.error(msg)
-            emit("error", message=msg)
-            print(json.dumps({"stage":"sync_summary","error":"no_snapshot_tables"}, ensure_ascii=False))
-            print("SYNC COMPLETE")
-            return
+            raise RuntimeError("No idnes_* snapshot tables found")
+
         snapshot_date = _date_from_tbl(latest_tbl)
         emit("source_selected", table=latest_tbl, snapshot_date=str(snapshot_date))
 
@@ -207,23 +225,19 @@ def main():
         df_std["id"] = df_std["id"].astype(str)
         df_typ["site_id"] = df_typ["site_id"].astype(str)
 
-        typical_rows_before = int(df_typ.shape[0])
-        emit("source_loaded", standart_rows=int(df_std.shape[0]), typical_rows=typical_rows_before)
+        typical_before = int(df_typ.shape[0])
+        emit("source_loaded", standart_rows=int(df_std.shape[0]), typical_rows=typical_before)
 
         new_mask = ~df_std["id"].isin(df_typ["site_id"])
         df_new = df_std[new_mask]
         to_insert = int(df_new.shape[0])
         emit("new_detected", count=to_insert)
 
-        inserted = 0
-        updated = 0
-        archived = 0
-        dedup_removed = 0
+        inserted = updated = archived = dedup_removed = 0
 
         if to_insert:
             df_out = _transform(df_new)
 
-            # site_id под ON CONFLICT
             dedup_removed = _ensure_unique_index()
             if dedup_removed:
                 emit("dedup", removed=dedup_removed)
@@ -234,14 +248,15 @@ def main():
                 "area_build","area_land","street","city_part","city","district",
                 "house_number","longitude","latitude"
             ]
+
             if not DRY_RUN:
                 with engine.begin() as conn:
                     conn.execute(text("SET LOCAL lock_timeout = '5s'"))
                     conn.execute(text("SET LOCAL statement_timeout = '5min'"))
-                    conn.execute(text("SET LOCAL synchronous_commit = off"))
-
                     conn.execute(text("DROP TABLE IF EXISTS tmp_idnes_typical"))
-                    conn.execute(text('CREATE TEMP TABLE tmp_idnes_typical (LIKE public."idnes_typical" INCLUDING ALL)'))
+                    conn.execute(text(
+                        'CREATE TEMP TABLE tmp_idnes_typical (LIKE public."idnes_typical" INCLUDING ALL)'
+                    ))
 
                     df_out[cols].to_sql(
                         "tmp_idnes_typical",
@@ -261,7 +276,6 @@ def main():
 
                     conn.execute(text("DROP TABLE IF EXISTS tmp_idnes_typical"))
 
-        log.info(f"[INSERT] inserted={inserted} (dry_run={DRY_RUN})")
         emit("insert", inserted=inserted, dry_run=DRY_RUN)
 
         if not DRY_RUN:
@@ -269,14 +283,14 @@ def main():
                 upd = conn.execute(text("""
                     UPDATE public."idnes_typical" AS t
                     SET archived_date = s.archived_date,
-                        available     = (s.archived_date IS NULL)
+                        available = (s.archived_date IS NULL)
                     FROM public."idnes_standart" AS s
                     WHERE t.site_id = s.id::text
-                      AND COALESCE(t.archived_date, '1970-01-01'::timestamptz)
-                          IS DISTINCT FROM COALESCE(s.archived_date, '1970-01-01'::timestamptz)
+                      AND COALESCE(t.archived_date,'1970-01-01') 
+                          IS DISTINCT FROM COALESCE(s.archived_date,'1970-01-01')
                 """))
                 updated = upd.rowcount or 0
-        log.info(f"[UPDATE] updated={updated} (dry_run={DRY_RUN})")
+
         emit("update", updated=updated, dry_run=DRY_RUN)
 
         if not DRY_RUN:
@@ -284,60 +298,72 @@ def main():
                 arc = conn.execute(text("""
                     UPDATE public."idnes_typical" t
                     SET archived_date = NOW(),
-                        available     = FALSE
+                        available = FALSE
                     WHERE t.available = TRUE
-                      AND NOT EXISTS (SELECT 1 FROM public."idnes_standart" s WHERE s.id::text = t.site_id)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM public."idnes_standart" s 
+                          WHERE s.id::text = t.site_id
+                      )
                 """))
                 archived = arc.rowcount or 0
-        log.info(f"[ARCHIVE] archived_missing={archived} (dry_run={DRY_RUN})")
+
         emit("archive", archived=archived, dry_run=DRY_RUN)
 
         with engine.begin() as conn:
             agg = conn.execute(text("""
                 SELECT 
-                  COUNT(*)::bigint AS total_rows,
-                  COUNT(*) FILTER (WHERE added_date::date = :d)::bigint AS added_on_snapshot,
-                  COUNT(*) FILTER (WHERE archived_date::date = :d)::bigint AS archived_on_snapshot,
-                  COUNT(*) FILTER (WHERE available)::bigint AS active_now
+                  COUNT(*) AS total_rows,
+                  COUNT(*) FILTER (WHERE added_date::date = :d) AS added_today,
+                  COUNT(*) FILTER (WHERE archived_date::date = :d) AS archived_today,
+                  COUNT(*) FILTER (WHERE available) AS active_now
                 FROM public."idnes_typical";
             """), {"d": snapshot_date}).mappings().first()
 
         stats = {
-            "total_rows": int(agg["total_rows"]) if agg and agg["total_rows"] is not None else 0,
-            "added_on_snapshot": int(agg["added_on_snapshot"]) if agg and agg["added_on_snapshot"] is not None else 0,
-            "archived_on_snapshot": int(agg["archived_on_snapshot"]) if agg and agg["archived_on_snapshot"] is not None else 0,
-            "active_now": int(agg["active_now"]) if agg and agg["active_now"] is not None else 0,
-            "added_today": int(agg["added_on_snapshot"]) if agg and agg["added_on_snapshot"] is not None else 0,
-            "archived_today": int(agg["archived_on_snapshot"]) if agg and agg["archived_on_snapshot"] is not None else 0,
+            "total_rows": int(agg["total_rows"]),
+            "added_today": int(agg["added_today"]),
+            "archived_today": int(agg["archived_today"]),
+            "active_now": int(agg["active_now"]),
             "snapshot_date": str(snapshot_date),
             "phase_counts": {
-                "typical_rows_before": typical_rows_before,
+                "typical_rows_before": typical_before,
                 "inserted": inserted,
                 "updated": updated,
                 "archived": archived,
-                "dedup_removed": dedup_removed,
+                "dedup_removed": dedup_removed
             },
-            "dry_run": DRY_RUN,
+            "dry_run": DRY_RUN
         }
 
-        log.info(
-            f"[STATS] total={stats['total_rows']} "
-            f"added={stats['added_today']} "
-            f"archived={stats['archived_today']} "
-            f"active={stats['active_now']} "
-            f"inserted={inserted} updated={updated} archived={archived} "
-            f"dedup_removed={dedup_removed}"
-        )
-        emit("summary", **stats)
-        emit("done", duration_s=(datetime.now() - t0).total_seconds())
+        final = {
+            "stage": "sync_summary",
+            "stats": {
+                **stats,
+                "status": "ok",
+                "duration_s": (datetime.now() - t0).total_seconds()
+            }
+        }
 
-        print(json.dumps({"stage": "sync_summary", "stats": stats}, ensure_ascii=False))
-        print("SYNC COMPLETE")
+        print(json.dumps(final, ensure_ascii=False))
+        sys.exit(0)
 
     except Exception as e:
         log.exception("Fatal error in idnes-typical")
-        emit("error", message=str(e))
+
+        fail = {
+            "stage": "sync_summary",
+            "stats": {
+                "status": "failed",
+                "error": str(e),
+                "snapshot_date": str(snapshot_date) if snapshot_date else None,
+                "dry_run": DRY_RUN,
+                "duration_s": (datetime.now() - t0).total_seconds()
+            }
+        }
+
+        print(json.dumps(fail, ensure_ascii=False))
         sys.exit(2)
+
 
 if __name__ == "__main__":
     main()

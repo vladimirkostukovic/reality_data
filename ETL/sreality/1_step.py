@@ -1,8 +1,10 @@
-
+#Synchronizes the latest sreality_YYYYMMDD snapshot into sreality_standart by inserting new listings,
+# reactivating returned ones,
+# archiving missing records, and outputting a standardized sync_summary log.
 from __future__ import annotations
-
 import json
 import sys
+import time
 import logging
 from pathlib import Path
 from datetime import date
@@ -21,16 +23,12 @@ _root.addHandler(stderr)
 _root.setLevel(logging.INFO)
 log = logging.getLogger("SrealitySQLSync")
 
-# ========== EMIT JSON → STDOUT ==========
-def emit(event: str, **payload) -> None:
-    print(json.dumps({"event": event, **payload}, ensure_ascii=False))
-
 # ========== CONFIG ==========
 PROJECT_ROOT = Path(__file__).resolve().parents[2] if len(Path(__file__).resolve().parents) >= 3 else Path.cwd()
 cfg = json.loads((PROJECT_ROOT / "config.json").read_text(encoding="utf-8"))
 
 db_url = URL.create(
-    drivername="postgresql+psycopg2",  # единообразно
+    drivername="postgresql+psycopg2",
     username=cfg.get("USER") or cfg.get("user"),
     password=cfg.get("PWD") or cfg.get("password"),
     host=cfg.get("HOST") or cfg.get("host"),
@@ -51,13 +49,14 @@ def _sorted_sreality_tables() -> List[str]:
     with engine.begin() as conn:
         rows = [r[0] for r in conn.execute(sql)]
     def key(t: str):
-        d = t[-8:]  # ddmmyyyy
-        return int(d[4:]), int(d[2:4]), int(d[:2])  # yyyy, mm, dd
+        d = t[-8:]
+        return int(d[4:]), int(d[2:4]), int(d[:2])
     return sorted(rows, key=key)
 
 def _date_from_table(tbl: str) -> str:
-    d = tbl[-8:]  # ddmmyyyy
-    return f"{d[4:]}-{d[2:4]}-{d[:2]}"  # YYYY-MM-DD
+    d = tbl[-8:]
+    return f"{d[4:]}-{d[2:4]}-{d[:2]}"
+
 
 def _get_table_columns(table: str) -> Dict[str, str]:
     sql = text("""
@@ -69,7 +68,7 @@ def _get_table_columns(table: str) -> Dict[str, str]:
         rows = conn.execute(sql, {"t": table}).fetchall()
     return {r[0]: r[1] for r in rows}
 
-def _null_cast_for_udt(udt: str) -> str:
+def _null_cast(udt: str) -> str:
     mapping = {
         "int2":"smallint","int4":"integer","int8":"bigint",
         "float4":"real","float8":"double precision","numeric":"numeric",
@@ -81,25 +80,27 @@ def _null_cast_for_udt(udt: str) -> str:
 
 # ========== MAIN ==========
 def sync_last_snapshot_sql_only() -> None:
-    emit("start", stage="sreality_standart")
+    t0 = time.perf_counter()
 
     tables = _sorted_sreality_tables()
     if len(tables) < 2:
-        msg = "not enough snapshot tables (need >= 2)"
-        log.error(msg)
-        print(json.dumps({"stage":"sync_summary","error":"not_enough_snapshots"}, ensure_ascii=False))
+        print(json.dumps({
+            "stage": "sync_summary",
+            "stats": {
+                "status": "failed",
+                "error": "not_enough_snapshots"
+            }
+        }, ensure_ascii=False))
         print("SYNC COMPLETE")
         return
 
     prev_tbl, curr_tbl = tables[-2], tables[-1]
     snap_date = _date_from_table(curr_tbl)
-    emit("source_selected", curr_table=curr_tbl, prev_table=prev_tbl, snapshot_date=snap_date)
-    log.info("current=%s | previous=%s | snapshot_date=%s", curr_tbl, prev_tbl, snap_date)
+    log.info(f"curr={curr_tbl} prev={prev_tbl} snapshot={snap_date}")
 
     target = "sreality_standart"
     target_types = _get_table_columns(target)
 
-    # внимание: в твоей схеме поле называется 'avalaible'
     target_cols = [
         "added_date","archived_date","avalaible",
         "id","name","price_czk","price_czk_per_sqm","price_summary_czk",
@@ -114,8 +115,8 @@ def sync_last_snapshot_sql_only() -> None:
     ]
 
     snapshot_cols = set(_get_table_columns(curr_tbl).keys())
-    select_exprs: List[str] = []
-    missing: List[str] = []
+    missing = []
+    select_exprs = []
 
     for col in target_cols:
         if col == "added_date":
@@ -130,10 +131,7 @@ def sync_last_snapshot_sql_only() -> None:
             else:
                 missing.append(col)
                 udt = target_types.get(col, "text")
-                select_exprs.append(f"NULL::{_null_cast_for_udt(udt)} AS {col}")
-
-    if missing:
-        log.info("snapshot %s missing columns: %s", curr_tbl, ", ".join(missing))
+                select_exprs.append(f"NULL::{_null_cast(udt)} AS {col}")
 
     insert_sql = text(f"""
         INSERT INTO public."{target}" ({", ".join(target_cols)})
@@ -181,16 +179,14 @@ def sync_last_snapshot_sql_only() -> None:
 
         agg = conn.execute(text(f"""
             SELECT
-              COUNT(*)::bigint                                                   AS total_rows,
-              COUNT(*) FILTER (WHERE added_date = CURRENT_DATE)::bigint          AS added_today,
-              COUNT(*) FILTER (WHERE archived_date::date = CURRENT_DATE)::bigint AS archived_today,
-              COUNT(*) FILTER (WHERE avalaible)::bigint                          AS active_now
+              COUNT(*)::bigint AS total_rows,
+              COUNT(*) FILTER (WHERE added_date = CURRENT_DATE) AS added_today,
+              COUNT(*) FILTER (WHERE archived_date::date = CURRENT_DATE) AS archived_today,
+              COUNT(*) FILTER (WHERE avalaible) AS active_now
             FROM public."{target}";
         """)).mappings().one()
 
-    log.info("[ADD]=%d | [REACT]=%d | [ARCH]=%d", inserted, reactivated, archived)
-    log.info("[STATS] total=%s added_today=%s archived_today=%s active_now=%s",
-             agg["total_rows"], agg["added_today"], agg["archived_today"], agg["active_now"])
+    source_rows = int(agg["total_rows"])  # fallback
 
     print(json.dumps({
         "stage": "sync_summary",
@@ -198,20 +194,27 @@ def sync_last_snapshot_sql_only() -> None:
             "snapshot_date": snap_date,
             "curr_table": curr_tbl,
             "prev_table": prev_tbl,
+
             "total_rows": int(agg["total_rows"]),
             "added_today": int(agg["added_today"]),
             "archived_today": int(agg["archived_today"]),
             "active_now": int(agg["active_now"]),
+
             "phase_counts": {
-                "source_rows": None,
-                "added": int(inserted),
-                "reactivated": int(reactivated),
-                "archived": int(archived),
+                "source_rows": source_rows,
+                "added": inserted,
+                "reactivated": reactivated,
+                "archived": archived
             },
-            "dry_run": False
+
+            "dry_run": False,
+            "status": "ok",
+            "duration_s": round((time.perf_counter() - t0), 3)
         }
     }, ensure_ascii=False))
+
     print("SYNC COMPLETE")
+
 
 if __name__ == "__main__":
     sync_last_snapshot_sql_only()

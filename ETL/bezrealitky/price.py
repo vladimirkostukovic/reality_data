@@ -1,3 +1,6 @@
+# Detects price changes between yesterday and today's snapshots, writes new entries,
+# enforces deduplication + indexes, and emits a unified JSON summary for the orchestrator.
+
 from __future__ import annotations
 
 import sys
@@ -10,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, text
 
-# === LOGGING  ===
+# === LOGGING ===
 _root = logging.getLogger()
 for h in list(_root.handlers):
     _root.removeHandler(h)
@@ -22,12 +25,12 @@ log = logging.getLogger("BezrealitkyPriceTrack")
 
 # === CONFIG ===
 PROJECT_ROOT = Path(__file__).resolve().parents[2] if len(Path(__file__).resolve().parents) >= 3 else Path.cwd()
-config_path = PROJECT_ROOT / "config.json"
-if not config_path.exists():
+cfg_path = PROJECT_ROOT / "config.json"
+if not cfg_path.exists():
     alt = Path(__file__).resolve().parent / "config.json"
-    config_path = alt if alt.exists() else config_path
+    cfg_path = alt if alt.exists() else cfg_path
 
-cfg = json.loads(config_path.read_text(encoding="utf-8"))
+cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
 USER = cfg.get("USER") or cfg.get("user")
 PWD  = cfg.get("PWD")  or cfg.get("password")
 HOST = cfg.get("HOST") or cfg.get("host")
@@ -35,202 +38,115 @@ PORT = cfg.get("PORT") or cfg.get("port")
 DB   = cfg.get("DB")   or cfg.get("dbname")
 DRY_RUN = bool(cfg.get("DRY_RUN", False))
 
-def make_db_url() -> tuple[str, str]:
+def make_db_url():
     try:
-        import psycopg  # noqa
+        import psycopg
         return ("psycopg", f"postgresql+psycopg://{USER}:{PWD}@{HOST}:{PORT}/{DB}")
     except ModuleNotFoundError:
-        try:
-            import psycopg2  # noqa
-            return ("psycopg2", f"postgresql+psycopg2://{USER}:{PWD}@{HOST}:{PORT}/{DB}")
-        except ModuleNotFoundError:
-            raise RuntimeError(
-                "Нет драйвера Postgres. Установи один:\n"
-                "  pip install 'psycopg[binary]>=3.1'\n"
-                "  или\n"
-                "  pip install 'psycopg2-binary>=2.9'"
-            )
+        import psycopg2
+        return ("psycopg2", f"postgresql+psycopg2://{USER}:{PWD}@{HOST}:{PORT}/{DB}")
 
 driver, DB_URL = make_db_url()
-log.info(f"[DB] driver={driver} host={HOST} db={DB}")
-
 engine = create_engine(DB_URL, pool_pre_ping=True, connect_args={"connect_timeout": 10})
 
-# === EMIT JSON → STDOUT ===
-def emit(event: str, **payload) -> None:
-    print(json.dumps({"event": event, **payload}, ensure_ascii=False))
-
-# === time helpers (Europe/Prague) ===
+# === TIME ===
 PRG = ZoneInfo("Europe/Prague")
-def today_prague() -> date:
-    return datetime.now(PRG).date()
+TODAY: date = datetime.now(PRG).date()
+YESTERDAY: date = TODAY - timedelta(days=1)
 
-TODAY = today_prague()
-YESTERDAY = TODAY - timedelta(days=1)
-
-# === helpers ===
-def parse_table_date(table_name: str) -> date | None:
-    if not table_name.startswith("bzereality_") or len(table_name) < 19:
+# === HELPERS ===
+def parse_table_date(table: str) -> date | None:
+    if not table.startswith("bzereality_") or len(table) < 19:
         return None
-    d = table_name[-8:]  # DDMMYYYY
+    d = table[-8:]
     try:
         return date(int(d[4:]), int(d[2:4]), int(d[:2]))
     except Exception:
         return None
 
-def date_from_table_name_str(table_name: str) -> str:
-    dt = parse_table_date(table_name)
-    return dt.isoformat() if dt else None
-
-def get_all_bz_tables() -> list[str]:
-    q = text("""
+def list_snapshots() -> list[tuple[date, str]]:
+    sql = text("""
         SELECT table_name 
         FROM information_schema.tables
-        WHERE table_schema = 'public'
+        WHERE table_schema='public'
           AND table_name LIKE 'bzereality\\_%' ESCAPE '\\'
           AND table_name ~ '^bzereality_[0-9]{8}$'
     """)
-    with engine.begin() as c:
-        return [r[0] for r in c.execute(q)]
+    with engine.begin() as conn:
+        names = [r[0] for r in conn.execute(sql)]
 
-def pick_snapshots_for_today() -> tuple[str, str, str]:
-    tables = get_all_bz_tables()
-    dated = []
-    for t in tables:
+    out = []
+    for t in names:
         dt = parse_table_date(t)
-        if dt is not None and dt <= TODAY:
-            dated.append((dt, t))
-    dated.sort()  # по дате по возрастанию
+        if dt:
+            out.append((dt, t))
+    return sorted(out)
 
+def pick_snapshots() -> tuple[str, str, str]:
+    dated = list_snapshots()
     if len(dated) < 2:
-        msg = "Not enough snapshots <= TODAY to compare"
-        log.error(msg)
-        emit("error", message=msg, today=str(TODAY))
-        print(json.dumps({"stage": "sync_summary", "error": "not_enough_snapshots"}, ensure_ascii=False))
-        print("SYNC COMPLETE")
-        raise SystemExit(1)
+        raise RuntimeError("Not enough snapshots to compare")
 
     by_date = {dt: t for dt, t in dated}
-    curr_table = by_date.get(TODAY)
+
     prev_table = by_date.get(YESTERDAY)
+    curr_table = by_date.get(TODAY)
 
-    if not curr_table or not prev_table:
-        problems = []
-        if not prev_table:
-            problems.append(f"no snapshot for yesterday ({YESTERDAY})")
-        if not curr_table:
-            problems.append(f"no snapshot for today ({TODAY})")
-        emit("dates_mismatch", ok=False, problems=problems, available_dates=[str(d) for d,_ in dated[-5:]])
-        print(json.dumps({"stage":"sync_summary","error":"dates_mismatch","problems":problems}, ensure_ascii=False))
-        print("SYNC COMPLETE")
-        raise SystemExit(1)
+    if not prev_table or not curr_table:
+        raise RuntimeError(
+            f"Missing snapshots for comparison: prev({YESTERDAY}), curr({TODAY})"
+        )
 
-    change_date = TODAY.isoformat()
-    return prev_table, curr_table, change_date
-
-def count_dupes(conn) -> int:
-    sql = text("""
-        SELECT COALESCE(SUM(cnt),0)::bigint
-        FROM (
-          SELECT COUNT(*) AS cnt
-          FROM public.bezrealitky_price
-          GROUP BY id::text, change_date::date, old_price::numeric, new_price::numeric
-          HAVING COUNT(*) > 1
-        ) s
-    """)
-    return int(conn.execute(sql).scalar_one())
-
-def log_dupe_samples(conn):
-    top = conn.execute(text("""
-        SELECT id::text AS id, change_date::date AS change_date, 
-               old_price::numeric, new_price::numeric, COUNT(*) AS cnt
-        FROM public.bezrealitky_price
-        GROUP BY 1,2,3,4
-        HAVING COUNT(*) > 1
-        ORDER BY cnt DESC
-        LIMIT 10
-    """)).mappings().all()
-    if top:
-        log.warning(f"[DEDUP] top duplicate keys: {[dict(r) for r in top]}")
+    return prev_table, curr_table, TODAY.isoformat()
 
 def run_dedupe():
     with engine.begin() as conn:
-        conn.execute(text("SET LOCAL lock_timeout = '5s'"))
-        conn.execute(text("SET LOCAL statement_timeout = '5min'"))
-        log_dupe_samples(conn)
         deleted = len(conn.execute(text("""
             WITH ranked AS (
-              SELECT ctid,
-                     ROW_NUMBER() OVER (
-                       PARTITION BY id::text, change_date::date, old_price::numeric, new_price::numeric
-                       ORDER BY ctid
-                     ) AS rn
-              FROM public.bezrealitky_price
+                SELECT ctid,
+                       ROW_NUMBER() OVER (
+                         PARTITION BY id::text, change_date::date, old_price::numeric, new_price::numeric
+                         ORDER BY ctid
+                       ) AS rn
+                FROM public.bezrealitky_price
             )
             DELETE FROM public.bezrealitky_price p
             USING ranked r
-            WHERE p.ctid = r.ctid
-              AND r.rn > 1
+            WHERE p.ctid = r.ctid AND r.rn > 1
             RETURNING 1
         """)).fetchall())
-        log.warning(f"[DEDUP] removed={deleted}")
+    return deleted
 
-def ensure_read_indexes():
+def ensure_indexes():
     with engine.begin() as conn:
-        conn.execute(text("SET LOCAL lock_timeout = '5s'"))
-        conn.execute(text("SET LOCAL statement_timeout = '5min'"))
-        conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS ix_bz_price_id_date
-              ON public.bezrealitky_price (id, change_date)
-        """))
-
-def ensure_unique_index():
-    with engine.begin() as conn:
-        conn.execute(text("SET LOCAL lock_timeout = '5s'"))
-        conn.execute(text("SET LOCAL statement_timeout = '5min'"))
         conn.execute(text("""
             CREATE UNIQUE INDEX IF NOT EXISTS ux_bz_price_unique
-              ON public.bezrealitky_price (id, change_date, old_price, new_price)
+            ON public.bezrealitky_price (id, change_date, old_price, new_price)
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_bz_price_id_date
+            ON public.bezrealitky_price (id, change_date)
         """))
 
-# === main ===
-def track_price_changes_latest():
+# === MAIN ===
+def run():
     t0 = time.perf_counter()
     try:
-        emit("start", stage="price_track", driver=driver, dry_run=DRY_RUN, today=str(TODAY), yesterday=str(YESTERDAY))
+        prev_table, curr_table, change_date = pick_snapshots()
 
-        prev_table, curr_table, change_date = pick_snapshots_for_today()
-        log.info(f"Comparing snapshots: {prev_table} -> {curr_table} (change_date={change_date})")
-        emit("snapshots_selected", prev=prev_table, curr=curr_table, change_date=change_date)
-
-        ensure_read_indexes()
-
-        with engine.begin() as conn:
-            dupes = count_dupes(conn)
-        emit("dedupe_checked", duplicates=dupes)
-        if dupes > 0 and not DRY_RUN:
-            log.warning(f"[DEDUP] duplicates detected: {dupes}")
-            run_dedupe()
-            emit("dedupe_performed", removed=">0")
-        else:
-            emit("dedupe_skipped", reason="dry_run" if DRY_RUN else "no_duplicates")
-
+        # dedupe + indexes
         if not DRY_RUN:
-            ensure_unique_index()
-            emit("unique_index", status="ensured")
-        else:
-            emit("unique_index", status="skipped_dry_run")
+            run_dedupe()
+            ensure_indexes()
 
         SQL_COUNT = f"""
             WITH prev AS (
-                SELECT id::text AS id, price::numeric AS price
-                FROM public."{prev_table}"
+                SELECT id::text, price::numeric FROM public."{prev_table}"
             ),
             curr AS (
-                SELECT id::text AS id, price::numeric AS price
-                FROM public."{curr_table}"
+                SELECT id::text, price::numeric FROM public."{curr_table}"
             )
-            SELECT COUNT(*)::bigint
+            SELECT COUNT(*)
             FROM prev p
             JOIN curr c USING (id)
             WHERE p.price IS NOT NULL
@@ -240,12 +156,10 @@ def track_price_changes_latest():
 
         SQL_INSERT = f"""
             WITH prev AS (
-                SELECT id::text AS id, price::numeric AS price
-                FROM public."{prev_table}"
+                SELECT id::text, price::numeric FROM public."{prev_table}"
             ),
             curr AS (
-                SELECT id::text AS id, price::numeric AS price
-                FROM public."{curr_table}"
+                SELECT id::text, price::numeric FROM public."{curr_table}"
             ),
             diffs AS (
                 SELECT c.id, p.price AS old_price, c.price AS new_price
@@ -256,52 +170,60 @@ def track_price_changes_latest():
                   AND p.price <> c.price
             )
             INSERT INTO public.bezrealitky_price (id, old_price, new_price, change_date)
-            SELECT d.id, d.old_price, d.new_price, CAST(:change_date AS date)
-            FROM diffs d
+            SELECT id, old_price, new_price, CAST(:d AS date)
+            FROM diffs
             ON CONFLICT (id, change_date, old_price, new_price) DO NOTHING
         """
 
         with engine.begin() as conn:
-            conn.execute(text("SET LOCAL lock_timeout = '5s'"))
-            conn.execute(text("SET LOCAL statement_timeout = '5min'"))
-
             candidates = int(conn.execute(text(SQL_COUNT)).scalar_one())
-            emit("candidates_counted", count=candidates)
 
             inserted = 0
             if not DRY_RUN and candidates > 0:
-                res = conn.execute(text(SQL_INSERT), {"change_date": change_date})
+                res = conn.execute(text(SQL_INSERT), {"d": change_date})
                 inserted = res.rowcount or 0
-            emit("insert", inserted=inserted, dry_run=DRY_RUN)
 
-            total_prev = int(conn.execute(text(f'SELECT COUNT(*) FROM public."{prev_table}"')).scalar_one())
-            total_curr = int(conn.execute(text(f'SELECT COUNT(*) FROM public."{curr_table}"')).scalar_one())
-            price_total = int(conn.execute(text('SELECT COUNT(*) FROM public.bezrealitky_price')).scalar_one())
+            prev_rows = int(conn.execute(text(f'SELECT COUNT(*) FROM public."{prev_table}"')).scalar_one())
+            curr_rows = int(conn.execute(text(f'SELECT COUNT(*) FROM public."{curr_table}"')).scalar_one())
+            price_rows_total = int(conn.execute(text('SELECT COUNT(*) FROM public.bezrealitky_price')).scalar_one())
 
-        stats = {
+        summary = {
+            "dry_run": DRY_RUN,
+            "snapshot_date": change_date,
             "prev_table": prev_table,
             "curr_table": curr_table,
-            "change_date": change_date,
             "candidates": candidates,
             "inserted_new": inserted,
-            "prev_rows": total_prev,
-            "curr_rows": total_curr,
-            "price_rows_total": price_total,
-            "dry_run": DRY_RUN
+            "prev_rows": prev_rows,
+            "curr_rows": curr_rows,
+            "price_rows_total": price_rows_total,
+            "status": "ok",
+            "duration_s": round(time.perf_counter() - t0, 3)
         }
-        emit("summary", stats=stats)
-        emit("done", duration_s=round(time.perf_counter() - t0, 3))
 
-        print(json.dumps({"stage": "sync_summary", "stats": stats}, ensure_ascii=False))
-        print("SYNC COMPLETE")
+        print(json.dumps({
+            "stage": "sync_summary",
+            "stats": summary
+        }, ensure_ascii=False))
+
         sys.exit(0)
 
-    except SystemExit:
-        raise
     except Exception as e:
-        log.exception("Fatal error in price tracking")
-        emit("error", message=str(e))
+        log.exception("Fatal error in price ETL")
+
+        err = {
+            "dry_run": DRY_RUN,
+            "status": "failed",
+            "error": str(e),
+            "duration_s": round(time.perf_counter() - t0, 3)
+        }
+
+        print(json.dumps({
+            "stage": "sync_summary",
+            "stats": err
+        }, ensure_ascii=False))
+
         sys.exit(2)
 
 if __name__ == "__main__":
-    track_price_changes_latest()
+    run()
