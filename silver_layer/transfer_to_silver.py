@@ -1,3 +1,7 @@
+# Merges all typical source tables into silver.summarized with deduplication and type-safe key alignment.
+# Ensures ingest timestamps, source_id/site_id consistency, and strict mass-balance sanity checks.
+# Outputs unified JSON sync_summary with before/after counts, inserted rows, and validation diagnostics.
+
 from __future__ import annotations
 import sys, json, time, logging
 from pathlib import Path
