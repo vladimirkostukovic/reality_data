@@ -1,4 +1,5 @@
-
+#This script synchronizes summarized_geo_subset with new records from summarized_geo.
+#It inserts all missing internal_id rows into the subset table and marks them as not yet validated.
 from __future__ import annotations
 import json
 import time
@@ -9,7 +10,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
 # ============ CONFIG ============
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 cfg = json.loads((PROJECT_ROOT / "config.json").read_text(encoding="utf-8"))
 
 DB_URL = f"postgresql+psycopg2://{cfg['USER']}:{cfg['PWD']}@{cfg['HOST']}:{cfg['PORT']}/{cfg['DB']}"
@@ -22,14 +23,25 @@ DST = "summarized_geo_subset"
 # ============ MAIN ============
 def main():
     t0 = time.time()
-    out = {"module": "subset_sync", "ok": True, "added": 0, "total_before": 0, "total_after": 0}
+
+    summary = {
+        "stage": "subset_sync",
+        "status": "ok",
+        "stats": {
+            "total_before": 0,
+            "total_after": 0,
+            "added": 0,
+            "duration_s": 0.0
+        },
+        "note": None
+    }
 
     try:
         with engine.begin() as conn:
             conn.execute(text("SET LOCAL statement_timeout = '5min'"))
 
             before = conn.execute(text(f"SELECT COUNT(*) FROM {SCHEMA}.{DST}")).scalar()
-            out["total_before"] = before
+            summary["stats"]["total_before"] = before
 
             missing_ids = pd.read_sql(
                 f"""
@@ -47,15 +59,12 @@ def main():
             )
 
             if missing_ids.empty:
-                out["note"] = "no new rows"
-                out["elapsed_s"] = round(time.time() - t0, 3)
-                print(json.dumps(out, ensure_ascii=False))
-                return
+                summary["note"] = "no new rows"
+                return summary   # <--- ВАЖНО: просто возвращаем!
 
             missing_ids["geo_ok"] = False
             missing_ids["not_true"] = True
 
-            # 4. апендим
             missing_ids.to_sql(
                 DST,
                 con=conn,
@@ -69,14 +78,18 @@ def main():
             added = len(missing_ids)
             after = conn.execute(text(f"SELECT COUNT(*) FROM {SCHEMA}.{DST}")).scalar()
 
-            out.update({"added": added, "total_after": after})
+            summary["stats"]["added"] = added
+            summary["stats"]["total_after"] = after
 
     except SQLAlchemyError as e:
-        out["ok"] = False
-        out["error"] = str(e)
+        summary["status"] = "fail"
+        summary["error"] = str(e)
+    except Exception as e:
+        summary["status"] = "fail"
+        summary["error"] = str(e)
     finally:
-        out["elapsed_s"] = round(time.time() - t0, 3)
-        print(json.dumps(out, ensure_ascii=False))
+        summary["stats"]["duration_s"] = round(time.time() - t0, 3)
+        print(json.dumps(summary, ensure_ascii=False))
 
 
 if __name__ == "__main__":

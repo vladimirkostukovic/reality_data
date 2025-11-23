@@ -1,3 +1,5 @@
+# This script normalizes geo fields across Czech regions using RÚIAN reference data.
+# It processes each region independently and returns a standard sync_summary JSON log.
 
 from __future__ import annotations
 import json
@@ -12,7 +14,7 @@ import time
 
 # ================== CONFIG ==================
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 cfg = json.loads((PROJECT_ROOT / "config.json").read_text(encoding="utf-8"))
 
 DB_USER = cfg["USER"]
@@ -43,12 +45,6 @@ KRAJ_CONFIG = {
 
 # ================== UTILS ==================
 
-def log(msg: str):
-    ts = time.strftime("%H:%M:%S")
-    sys.stdout.write(f"[{ts}] {msg}\n")
-    sys.stdout.flush()
-
-
 def strip_diacritics(s: str) -> str:
     if s is None:
         return ""
@@ -77,9 +73,7 @@ def fuzzy_best_match(query: str, candidates: list[str], score_cutoff=87) -> str 
         scorer=fuzz.WRatio,
         score_cutoff=score_cutoff,
     )
-    if res:
-        return res[0]
-    return None
+    return res[0] if res else None
 
 
 def get_conn():
@@ -102,7 +96,6 @@ def ensure_columns_exist(cur):
               AND column_name  = %s
         """, (SCHEMA_SILVER, TABLE_SUBSET, col))
         if not cur.fetchone():
-            log(f"Adding column {col}")
             cur.execute(
                 f'ALTER TABLE {SCHEMA_SILVER}.{TABLE_SUBSET} '
                 f'ADD COLUMN {col} boolean;'
@@ -112,7 +105,6 @@ def ensure_columns_exist(cur):
 # ================== RUIAN LOADER ==================
 
 def fetch_ruian_for_kraj(cur, kraj_name: str, ruian_table: str):
-    log(f"Loading RÚIAN for '{kraj_name}' from {ruian_table}...")
     cur.execute(f"""
         SELECT
             nazev_obce,
@@ -126,15 +118,12 @@ def fetch_ruian_for_kraj(cur, kraj_name: str, ruian_table: str):
     rows = cur.fetchall()
 
     if not rows:
-        log(f"  No data for {kraj_name} in table {ruian_table}")
         return None, None, None
 
     df = pd.DataFrame(
         rows,
         columns=["town_name", "part_name", "street_name", "region_name", "kraj_name"]
     )
-
-    log(f"  {len(df):,} RÚIAN rows for '{kraj_name}'")
 
     df["town_key_norm"] = df["town_name"].map(normalize)
     df["part_key_norm"] = df["part_name"].map(normalize)
@@ -158,18 +147,12 @@ def fetch_ruian_for_kraj(cur, kraj_name: str, ruian_table: str):
         .first()[["street_key_norm", "town_name", "region_name"]]
     )
 
-    log(f"  Unique towns: {len(town_df):,}")
-    log(f"  Unique town parts: {len(part_df):,}")
-    log(f"  Unique streets: {len(street_df):,}")
-
     return town_df, street_df, part_df
 
 
 # ================== SUBSET LOADER ==================
 
 def fetch_subset_for_kraj(cur, kraj_name: str) -> pd.DataFrame:
-    """Fetch records from subset where norm_district matches the region"""
-    log(f"Fetching records for norm_district = '{kraj_name}'...")
     cur.execute(f"""
         SELECT
             internal_id,
@@ -199,8 +182,6 @@ def fetch_subset_for_kraj(cur, kraj_name: str) -> pd.DataFrame:
         ],
     )
 
-    log(f"  Loaded {len(df):,} rows for '{kraj_name}'")
-
     df["city_key_norm"] = df["norm_city"].map(normalize)
     df["part_key_norm"] = df["norm_city_part"].map(normalize)
     df["street_key_norm"] = df["norm_street"].map(normalize)
@@ -213,13 +194,7 @@ def fetch_subset_for_kraj(cur, kraj_name: str) -> pd.DataFrame:
 
 # ================== DECISION LOGIC ==================
 
-def decide_row_for_kraj(row, kraj_name: str, town_df: pd.DataFrame, part_df: pd.DataFrame, street_df: pd.DataFrame):
-    """
-    Match address against RÚIAN data with priority:
-    1. Check norm_city against towns (direct match or fuzzy)
-    2. Check norm_city_part against town parts
-    3. Check norm_street against streets
-    """
+def decide_row_for_kraj(row, kraj_name: str, town_df, part_df, street_df):
     city_norm = row["city_key_norm"]
     part_norm = row["part_key_norm"]
     street_norm = row["street_key_norm"]
@@ -231,30 +206,33 @@ def decide_row_for_kraj(row, kraj_name: str, town_df: pd.DataFrame, part_df: pd.
     town_name = None
     region_nm = None
 
+    # direct or fuzzy match: city
     if city_norm:
-        city_match = town_df.loc[town_df["town_key_norm"] == city_norm]
-        if not city_match.empty:
-            m = city_match.iloc[0]
+        direct = town_df.loc[town_df["town_key_norm"] == city_norm]
+        if not direct.empty:
+            m = direct.iloc[0]
             town_name = m["town_name"]
             region_nm = m["region_name"]
         else:
-            best_city = fuzzy_best_match(city_norm, town_keys, 87)
-            if best_city:
-                m = town_df.loc[town_df["town_key_norm"] == best_city].iloc[0]
+            best = fuzzy_best_match(city_norm, town_keys, 87)
+            if best:
+                m = town_df.loc[town_df["town_key_norm"] == best].iloc[0]
                 town_name = m["town_name"]
                 region_nm = m["region_name"]
 
+    # fuzzy: part
     if town_name is None and part_norm:
-        best_part = fuzzy_best_match(part_norm, part_keys, 87)
-        if best_part:
-            m = part_df.loc[part_df["part_key_norm"] == best_part].iloc[0]
+        best = fuzzy_best_match(part_norm, part_keys, 87)
+        if best:
+            m = part_df.loc[part_df["part_key_norm"] == best].iloc[0]
             town_name = m["town_name"]
             region_nm = m["region_name"]
 
+    # fuzzy: street
     if town_name is None and street_norm:
-        best_street = fuzzy_best_match(street_norm, street_keys, 87)
-        if best_street:
-            m = street_df.loc[street_df["street_key_norm"] == best_street].iloc[0]
+        best = fuzzy_best_match(street_norm, street_keys, 87)
+        if best:
+            m = street_df.loc[street_df["street_key_norm"] == best].iloc[0]
             town_name = m["town_name"]
             region_nm = m["region_name"]
 
@@ -269,6 +247,7 @@ def decide_row_for_kraj(row, kraj_name: str, town_df: pd.DataFrame, part_df: pd.
             "matched": True,
         }
 
+    # fallback bad
     return {
         "fix_city": row["norm_city"],
         "fix_city_part": row["norm_city_part"],
@@ -282,14 +261,12 @@ def decide_row_for_kraj(row, kraj_name: str, town_df: pd.DataFrame, part_df: pd.
 
 # ================== BATCH UPDATER ==================
 
-def apply_updates(cur, rows_to_update, kraj_name: str, phase_label: str):
-    """Apply batch updates to subset table using temp staging table"""
+def apply_updates(cur, rows_to_update):
     if not rows_to_update:
-        log(f"{kraj_name} {phase_label}: no updates")
         return 0
 
-    tmp_name = f"tmp_geo_upd_{normalize(kraj_name).replace(' ', '_')}_{phase_label}"
-    cur.execute(f'DROP TABLE IF EXISTS {tmp_name}')
+    tmp_name = "tmp_geo_upd_stage"
+    cur.execute(f"DROP TABLE IF EXISTS {tmp_name}")
 
     cur.execute(f"""
         CREATE TEMP TABLE {tmp_name} (
@@ -326,45 +303,29 @@ def apply_updates(cur, rows_to_update, kraj_name: str, phase_label: str):
         WHERE s.internal_id = u.internal_id
     """)
 
-    updated = cur.rowcount
-    log(f"{kraj_name} {phase_label}: updated {updated:,} rows")
-    return updated
+    return cur.rowcount
 
 
-# ================== MAIN ==================
+# ================== MAIN REGION PROCESSOR ==================
 
 def process_one_kraj(cur, kraj_name: str, ruian_table: str) -> int:
-    """
-    Process one region:
-    1. Load RÚIAN reference data
-    2. Load subset records for this region
-    3. Fuzzy match by city/part/street (in that order)
-    4. Update subset table
-    Returns number of updated rows.
-    """
-
     town_df, street_df, part_df = fetch_ruian_for_kraj(cur, kraj_name, ruian_table)
     if town_df is None:
         return 0
 
     df = fetch_subset_for_kraj(cur, kraj_name)
     if df.empty:
-        log(f"{kraj_name}: no records in subset. Skipping.")
         return 0
 
-    good_updates = []
-    bad_updates = []
+    updates = []
 
-    t0 = time.time()
-
-    for i, row in df.iterrows():
-
-        if row["geo_ok"] is True:
+    for _, row in df.iterrows():
+        if row["geo_ok"]:
             continue
 
         dec = decide_row_for_kraj(row, kraj_name, town_df, part_df, street_df)
 
-        upd_tuple = (
+        updates.append((
             dec["fix_city"],
             dec["fix_city_part"],
             dec["fix_okres"],
@@ -372,48 +333,53 @@ def process_one_kraj(cur, kraj_name: str, ruian_table: str) -> int:
             dec["geo_ok"],
             dec["not_true"],
             int(row["internal_id"]),
-        )
+        ))
 
-        if dec["matched"]:
-            good_updates.append(upd_tuple)
-        else:
-            bad_updates.append(upd_tuple)
+    return apply_updates(cur, updates)
 
-        if i % 5000 == 0 and i > 0:
-            log(f"{kraj_name}: processed {i:,} rows...")
 
-    log(f"{kraj_name}: GOOD={len(good_updates):,} | BAD={len(bad_updates):,}")
-
-    total_upd = 0
-    total_upd += apply_updates(cur, good_updates, kraj_name, "good")
-    total_upd += apply_updates(cur, bad_updates, kraj_name, "bad")
-
-    log(f"{kraj_name}: total updated {total_upd:,} rows in {round(time.time() - t0, 2)}s")
-    return total_upd
-
+# ================== MAIN ==================
 
 def main():
-    log("=== START FULL REGION GEO NORMALIZATION ===")
+    start_ts = time.time()
 
-    with get_conn() as conn:
-        conn.autocommit = False
-        cur = conn.cursor()
+    summary = {
+        "stage": "geo_normalization_regions",
+        "status": "ok",
+        "sync_summary": {
+            "regions_total": len(KRAJ_CONFIG),
+            "regions_processed": 0,
+            "rows_updated_total": 0,
+            "per_region": {},
+            "duration_s": 0.0
+        }
+    }
 
-        ensure_columns_exist(cur)
-        conn.commit()
+    try:
+        with get_conn() as conn:
+            conn.autocommit = False
+            cur = conn.cursor()
 
-        grand_total = 0
-
-        for kraj_name, ruian_table in KRAJ_CONFIG.items():
-            if kraj_name == "Hlavní město Praha":
-                continue
-
-            log(f"--- {kraj_name} ---")
-            updated_rows = process_one_kraj(cur, kraj_name, ruian_table)
-            grand_total += updated_rows
+            ensure_columns_exist(cur)
             conn.commit()
 
-        log(f"=== DONE. Total updated {grand_total:,} rows across all regions ===")
+            for kraj_name, ruian_table in KRAJ_CONFIG.items():
+                updated_rows = process_one_kraj(cur, kraj_name, ruian_table)
+                conn.commit()
+
+                summary["sync_summary"]["regions_processed"] += 1
+                summary["sync_summary"]["rows_updated_total"] += updated_rows
+                summary["sync_summary"]["per_region"][kraj_name] = {
+                    "rows_updated": updated_rows
+                }
+
+            summary["sync_summary"]["duration_s"] = round(time.time() - start_ts, 3)
+
+    except Exception as e:
+        summary["status"] = "fail"
+        summary["sync_summary"]["error"] = str(e)
+
+    print(json.dumps(summary, ensure_ascii=False))
 
 
 if __name__ == "__main__":

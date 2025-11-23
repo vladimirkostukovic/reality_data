@@ -1,4 +1,6 @@
-
+#restores successfully normalized address records from geo_garbage back into summarized_geo,
+#inserting missing rows and updating existing ones with cleaned fields.
+#After restoration it removes processed records from geo_garbage to keep the table clean.
 from __future__ import annotations
 import sys, json, time, logging
 from pathlib import Path
@@ -18,7 +20,7 @@ logging.basicConfig(
 log = logging.getLogger("geo_restore")
 
 # ==== CONFIG ====
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 with open(PROJECT_ROOT / "config.json", "r", encoding="utf-8") as f:
     cfg = json.load(f)
 
@@ -29,6 +31,7 @@ SCHEMA = "silver"
 SRC = "geo_garbage"
 DST = "summarized_geo"
 
+
 def _cols(conn, schema: str, table: str) -> List[str]:
     q = text("""
         SELECT column_name
@@ -38,6 +41,7 @@ def _cols(conn, schema: str, table: str) -> List[str]:
     """)
     return conn.execute(q, {"s": schema, "t": table}).scalars().all()
 
+
 def _common_cols_for_insert(conn) -> List[str]:
     src = _cols(conn, SCHEMA, SRC)
     dst = _cols(conn, SCHEMA, DST)
@@ -45,25 +49,29 @@ def _common_cols_for_insert(conn) -> List[str]:
     dst = [c for c in dst if c != "ingested_at"]
     common = [c for c in src if c in dst]
     if "internal_id" not in common:
-        raise RuntimeError("Нет общего internal_id между geo_garbage и summarized_geo")
+        raise RuntimeError("No shared internal_id between geo_garbage and summarized_geo")
     return common
+
 
 def main():
     t0 = time.perf_counter()
-    out: Dict[str, object] = {
-        "module": "geo_garbage_restore",
-        "ok": True,
+
+    summary = {
         "candidates": 0,
         "inserted": 0,
         "updated": 0,
         "deleted_from_garbage": 0,
-        "elapsed_s": 0.0,
+        "elapsed_s": 0.0
     }
+
+    stage = "geo_garbage_restore"
+    status = "ok"
 
     try:
         with ENGINE.begin() as conn:
             conn.execute(text("SET LOCAL statement_timeout = '5min'"))
 
+            # ensure geo_status column exists
             conn.execute(text("""
                 DO $$
                 BEGIN
@@ -76,24 +84,24 @@ def main():
                 END$$;
             """), {"s": SCHEMA, "t": DST})
 
+            # candidates
             cand = pd.read_sql(f"""
                 SELECT g.*
                 FROM {SCHEMA}.{SRC} g
-                JOIN {SCHEMA}.summarized s USING (internal_id)   -- гарантируем FK
+                JOIN {SCHEMA}.summarized s USING (internal_id)
                 WHERE g.in_cz IS TRUE
                   AND g.geo_status IS TRUE
             """, con=conn)
-            out["candidates"] = int(len(cand))
+
+            summary["candidates"] = int(len(cand))
             if cand.empty:
-                log.info("no candidates (in_cz=TRUE & geo_status=TRUE)")
-                out["elapsed_s"] = round(time.perf_counter() - t0, 3)
-                sys.stdout.write(json.dumps(out) + "\n"); sys.stdout.flush()
+                summary["elapsed_s"] = round(time.perf_counter() - t0, 3)
+                print(json.dumps({"stage": stage, "status": status, "summary": summary}, ensure_ascii=False))
                 return
 
-            existing_ids = set(pd.read_sql(
-                f"SELECT internal_id FROM {SCHEMA}.{DST}",
-                con=conn
-            )["internal_id"].tolist())
+            existing_ids = set(
+                pd.read_sql(f"SELECT internal_id FROM {SCHEMA}.{DST}", con=conn)["internal_id"].tolist()
+            )
 
             to_insert = cand[~cand["internal_id"].isin(existing_ids)].copy()
             to_update = cand[cand["internal_id"].isin(existing_ids)].copy()
@@ -101,7 +109,7 @@ def main():
             log.info("candidates=%d | to_insert=%d | to_update=%d",
                      len(cand), len(to_insert), len(to_update))
 
-            ins_count = 0
+            # INSERT
             if not to_insert.empty:
                 common = _common_cols_for_insert(conn)
 
@@ -117,7 +125,7 @@ def main():
                     if_exists="append",
                     index=False,
                     method="multi",
-                    chunksize=50_000
+                    chunksize=50000
                 )
 
                 insert_cols = common.copy()
@@ -126,8 +134,6 @@ def main():
                 if "geo_status" not in insert_cols:
                     insert_cols.append("geo_status")
                     select_cols.append("TRUE AS geo_status")
-                else:
-                    pass
 
                 ins_sql = text(f"""
                     INSERT INTO {SCHEMA}.{DST} ({', '.join(insert_cols)}, ingested_at)
@@ -138,27 +144,27 @@ def main():
                         WHERE d.internal_id = t.internal_id
                     )
                 """)
-                res = conn.execute(ins_sql)
-                ins_count = res.rowcount or 0
-                out["inserted"] = int(ins_count)
-                log.info("inserted=%d", ins_count)
 
-            upd_count = 0
+                res = conn.execute(ins_sql)
+                summary["inserted"] = int(res.rowcount or 0)
+
+            # UPDATE
             if not to_update.empty:
-                cols_needed = ["internal_id", "norm_district", "norm_okres", "norm_city", "norm_city_part", "norm_street"]
+                cols_needed = ["internal_id", "norm_district", "norm_okres",
+                               "norm_city", "norm_city_part", "norm_street"]
                 present = [c for c in cols_needed if c in to_update.columns]
                 if "internal_id" not in present:
-                    raise RuntimeError("В geo_garbage нет internal_id для update")
+                    raise RuntimeError("Missing internal_id in geo_garbage for update")
 
                 conn.execute(text("DROP TABLE IF EXISTS tmp_geo_restore_upd"))
                 conn.execute(text("""
                     CREATE TEMP TABLE tmp_geo_restore_upd (
-                        internal_id   BIGINT PRIMARY KEY,
+                        internal_id BIGINT PRIMARY KEY,
                         norm_district TEXT,
-                        norm_okres    TEXT,
-                        norm_city     TEXT,
+                        norm_okres TEXT,
+                        norm_city TEXT,
                         norm_city_part TEXT,
-                        norm_street   TEXT
+                        norm_street TEXT
                     ) ON COMMIT DROP
                 """))
 
@@ -168,51 +174,61 @@ def main():
                     if_exists="append",
                     index=False,
                     method="multi",
-                    chunksize=50_000
+                    chunksize=50000
                 )
 
                 upd_sql = text(f"""
                     UPDATE {SCHEMA}.{DST} AS d
                     SET
-                      norm_district  = COALESCE(d.norm_district,  u.norm_district),
-                      norm_okres     = COALESCE(d.norm_okres,     u.norm_okres),
-                      norm_city      = COALESCE(d.norm_city,      u.norm_city),
-                      norm_city_part = COALESCE(d.norm_city_part, u.norm_city_part),
-                      norm_street    = COALESCE(d.norm_street,    u.norm_street),
+                      norm_district  = COALESCE(d.norm_district, u.norm_district),
+                      norm_okres     = COALESCE(d.norm_okres,    u.norm_okres),
+                      norm_city      = COALESCE(d.norm_city,     u.norm_city),
+                      norm_city_part = COALESCE(d.norm_city_part,u.norm_city_part),
+                      norm_street    = COALESCE(d.norm_street,   u.norm_street),
                       geo_status     = TRUE
                     FROM tmp_geo_restore_upd u
                     WHERE d.internal_id = u.internal_id
                 """)
-                res = conn.execute(upd_sql)
-                upd_count = res.rowcount or 0
-                out["updated"] = int(upd_count)
-                log.info("updated=%d", upd_count)
 
-            if ins_count or upd_count:
+                res = conn.execute(upd_sql)
+                summary["updated"] = int(res.rowcount or 0)
+
+            # DELETE FROM GARBAGE
+            if summary["inserted"] or summary["updated"]:
                 conn.execute(text("""
                     CREATE TEMP TABLE tmp_geo_restore_ids (internal_id BIGINT PRIMARY KEY) ON COMMIT DROP
                 """))
+
                 ids = pd.DataFrame({"internal_id": cand["internal_id"].unique()})
-                ids.to_sql("tmp_geo_restore_ids", con=conn, if_exists="append", index=False, method="multi")
+                ids.to_sql("tmp_geo_restore_ids", con=conn, if_exists="append",
+                           index=False, method="multi")
+
                 del_res = conn.execute(text(f"""
                     DELETE FROM {SCHEMA}.{SRC} g
                     USING tmp_geo_restore_ids i
                     WHERE g.internal_id = i.internal_id
                 """))
-                out["deleted_from_garbage"] = int(del_res.rowcount or 0)
-                log.info("deleted_from_garbage=%d", out["deleted_from_garbage"])
 
-        out["elapsed_s"] = round(time.perf_counter() - t0, 3)
-        sys.stdout.write(json.dumps(out) + "\n"); sys.stdout.flush()
+                summary["deleted_from_garbage"] = int(del_res.rowcount or 0)
 
-    except SQLAlchemyError as e:
-        log.error("db_error: %s", e)
-        sys.stdout.write(json.dumps({"module": "geo_garbage_restore", "error": str(e)}) + "\n")
-        raise
+        summary["elapsed_s"] = round(time.perf_counter() - t0, 3)
+
+        print(json.dumps({"stage": stage, "status": status, "summary": summary},
+                         ensure_ascii=False))
+
     except Exception as e:
-        log.error("unexpected: %s", e)
-        sys.stdout.write(json.dumps({"module": "geo_garbage_restore", "error": str(e)}) + "\n")
-        raise
+        status = "fail"
+        err = str(e)
+        log.error("fatal: %s", err)
+
+        print(json.dumps({
+            "stage": stage,
+            "status": status,
+            "error": err,
+            "summary": summary
+        }, ensure_ascii=False))
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
