@@ -1,3 +1,7 @@
+# Geo sync step: inserts new summarized records into silver.summarized_geo
+# and updates changed fields (archived_date, available, added_date).
+# Runs mass-balance, uniqueness, FK-coverage and garbage-exclusion sanity checks,
+# emitting strict JSON metrics for the wrapper.
 
 import sys
 import json
@@ -10,14 +14,14 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
-# --------- Logging ---------
+# --------- Logging  ---------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | geo_sync | %(message)s",
+    format="%(asctime)s | %(levelname)s | silver_geo | %(message)s",
     handlers=[logging.StreamHandler(sys.stderr)],
     force=True,
 )
-log = logging.getLogger("geo_sync")
+log = logging.getLogger("silver_geo")
 
 # --------- CONFIG ----------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +34,7 @@ DB_URL = (
 )
 engine = create_engine(DB_URL, pool_pre_ping=True)
 
-INGEST_COL = "ingested_at"  # timestamptz
+INGEST_COL = "ingested_at"
 INGEST_NOW = datetime.now(timezone.utc)
 
 
@@ -44,27 +48,27 @@ def _count_geo(conn) -> int:
 
 
 def ensure_columns(conn):
+    # ingested_at
     exists_ing = conn.execute(
         text("""
             SELECT 1
             FROM information_schema.columns
-            WHERE table_schema = 'silver'
-              AND table_name   = 'summarized_geo'
-              AND column_name  = :col
+            WHERE table_schema='silver'
+              AND table_name='summarized_geo'
+              AND column_name=:col
             LIMIT 1
         """),
         {"col": INGEST_COL},
     ).scalar()
     if not exists_ing:
-        log.info(f"ADD COLUMN silver.summarized_geo.{INGEST_COL}")
+        log.info("add_column: summarized_geo.ingested_at")
         conn.execute(text(f"""
             ALTER TABLE silver.summarized_geo
-            ADD COLUMN {INGEST_COL} timestamptz
-            DEFAULT NOW()
+            ADD COLUMN {INGEST_COL} timestamptz DEFAULT NOW();
         """))
         conn.execute(text(f"""
             ALTER TABLE silver.summarized_geo
-            ALTER COLUMN {INGEST_COL} DROP DEFAULT
+            ALTER COLUMN {INGEST_COL} DROP DEFAULT;
         """))
 
     # deal_type_value
@@ -72,18 +76,19 @@ def ensure_columns(conn):
         text("""
             SELECT 1
             FROM information_schema.columns
-            WHERE table_schema = 'silver'
-              AND table_name   = 'summarized_geo'
-              AND column_name  = 'deal_type_value'
+            WHERE table_schema='silver'
+              AND table_name='summarized_geo'
+              AND column_name='deal_type_value'
             LIMIT 1
         """)
     ).scalar()
+
     if not exists_dtv:
-        log.info("ADD COLUMN silver.summarized_geo.deal_type_value")
+        log.info("add_column: summarized_geo.deal_type_value")
         conn.execute(
             text("""
                 ALTER TABLE silver.summarized_geo
-                ADD COLUMN deal_type_value integer
+                ADD COLUMN deal_type_value integer;
             """)
         )
 
@@ -107,7 +112,7 @@ def classify_row(raw_deal: str, raw_name: str):
     dt = normtxt(raw_deal)
     nm = normtxt(raw_name)
 
-    # -------- prodej / sale --------
+    # SALE
     if (
         dt.startswith("prodej")
         or dt in ("prodej", "sale", "prodaja", "продажа")
@@ -117,7 +122,7 @@ def classify_row(raw_deal: str, raw_name: str):
     ):
         return "Prodej", 1
 
-    # -------- pronajem / nájem / аренда / rent --------
+    # RENT
     if (
         dt.startswith("pronajem")
         or dt in ("pronajem", "najem", "najmem", "аренда", "arenda", "rent")
@@ -127,19 +132,16 @@ def classify_row(raw_deal: str, raw_name: str):
         or nm.startswith("rent")
         or "pronajem" in nm
         or "pronajmu" in nm
-        or "nájem" in raw_deal.lower() if raw_deal else False
-        or "nájem" in raw_name.lower() if raw_name else False
+        or ("nájem" in raw_deal.lower() if raw_deal else False)
+        or ("nájem" in raw_name.lower() if raw_name else False)
     ):
         return "Pronájem", 2
 
-    # -------- dražba / aukce / аукцион --------
+    # AUCTION
     if (
         dt.startswith("drazb")
         or dt in ("drazba", "drazby", "aukce", "dražba", "аукцион")
-        or "drazb" in nm
-        or "dražb" in nm
-        or "aukce" in nm
-        or "аукцион" in nm
+        or "drazb" in nm or "dražb" in nm or "aukce" in nm or "аукцион" in nm
     ):
         return "Dražba", 3
 
@@ -164,8 +166,9 @@ def normalize_deal_type(df_sum: pd.DataFrame) -> pd.DataFrame:
     })
 
 
-def main() -> dict:
+def main():
     t0 = time.perf_counter()
+
     rows_inserted = 0
     rows_updated = 0
     before = 0
@@ -178,57 +181,50 @@ def main() -> dict:
             ensure_columns(conn)
 
             before = _count_geo(conn)
-            log.info("before=%d", before)
-            log.info("load summarized")
+            log.info(f"before_count={before}")
+
+            # LOAD summarized
+            log.info("load:summarized")
             df_sum = pd.read_sql(
                 """
-                SELECT internal_id,
-                       site_id,
-                       added_date,
-                       available,
-                       archived_date,
-                       source_id,
-                       category_value,
-                       category_name,
-                       name,
-                       deal_type,
-                       price,
-                       rooms,
-                       area_build,
-                       district,
-                       city,
-                       city_part,
-                       street,
-                       house_number,
-                       longitude,
-                       latitude
+                SELECT internal_id, site_id, added_date,
+                       available, archived_date, source_id,
+                       category_value, category_name, name,
+                       deal_type, price, rooms, area_build,
+                       district, city, city_part, street,
+                       house_number, longitude, latitude
                 FROM silver.summarized
                 """,
                 con=conn,
             )
+            log.info(f"rows_summarized={len(df_sum)}")
 
+            # NORMALIZATION
             norm_dt = normalize_deal_type(df_sum)
             df_sum["deal_type"] = norm_dt["deal_type"]
             df_sum["deal_type_value"] = norm_dt["deal_type_value"]
 
-            log.info("load summarized_geo")
+            # LOAD summarized_geo
+            log.info("load:summarized_geo")
             df_geo = pd.read_sql(
                 """
-                SELECT internal_id,
-                       archived_date,
-                       available,
-                       added_date
+                SELECT internal_id, archived_date,
+                       available, added_date
                 FROM silver.summarized_geo
                 """,
                 con=conn,
             )
+            log.info(f"rows_summarized_geo={len(df_geo)}")
 
-            log.info("load geo_garbage")
+            # LOAD geo_garbage
+            log.info("load:geo_garbage")
             df_garbage = pd.read_sql(
                 "SELECT internal_id FROM silver.geo_garbage",
                 con=conn,
             )
+            log.info(f"rows_geo_garbage={len(df_garbage)}")
 
+            # NEW ROWS
             ids_in_geo = set(df_geo["internal_id"])
             ids_in_garbage = set(df_garbage["internal_id"])
             new_ids = set(df_sum["internal_id"]) - ids_in_geo - ids_in_garbage
@@ -241,7 +237,6 @@ def main() -> dict:
             ].copy()
 
             expected_to_insert = len(df_new)
-
             df_new["geo_status"] = False
             df_new[INGEST_COL] = INGEST_NOW
 
@@ -253,33 +248,16 @@ def main() -> dict:
                     df_new[col] = df_new[col].where(pd.notnull(df_new[col]), None)
 
             allowed_columns = [
-                "internal_id",
-                "site_id",
-                "added_date",
-                "available",
-                "archived_date",
-                "source_id",
-                "category_value",
-                "category_name",
-                "name",
-                "deal_type",
-                "deal_type_value",
-                "price",
-                "rooms",
-                "area_build",
-                "district",
-                "city",
-                "city_part",
-                "street",
-                "house_number",
-                "longitude",
-                "latitude",
-                "geo_status",
-                INGEST_COL,
+                "internal_id", "site_id", "added_date", "available",
+                "archived_date", "source_id", "category_value",
+                "category_name", "name", "deal_type", "deal_type_value",
+                "price", "rooms", "area_build", "district", "city",
+                "city_part", "street", "house_number", "longitude",
+                "latitude", "geo_status", INGEST_COL,
             ]
-
             df_new = df_new[[c for c in allowed_columns if c in df_new.columns]]
 
+            # INSERT
             if not df_new.empty:
                 df_new.to_sql(
                     "summarized_geo",
@@ -291,26 +269,17 @@ def main() -> dict:
                     chunksize=50_000,
                 )
                 rows_inserted = len(df_new)
-                log.info(f"inserted: {rows_inserted}")
+                log.info(f"inserted_rows={rows_inserted}")
             else:
-                log.info("inserted: 0")
+                log.info("inserted_rows=0")
 
+            # UPDATE
             merged = pd.merge(
                 df_sum[
-                    [
-                        "internal_id",
-                        "archived_date",
-                        "available",
-                        "added_date",
-                    ]
+                    ["internal_id", "archived_date", "available", "added_date"]
                 ],
                 df_geo[
-                    [
-                        "internal_id",
-                        "archived_date",
-                        "available",
-                        "added_date",
-                    ]
+                    ["internal_id", "archived_date", "available", "added_date"]
                 ],
                 on="internal_id",
                 suffixes=("_sum", "_geo"),
@@ -324,12 +293,7 @@ def main() -> dict:
 
             to_update = merged.loc[
                 mask_change,
-                [
-                    "internal_id",
-                    "archived_date_sum",
-                    "available_sum",
-                    "added_date_sum",
-                ],
+                ["internal_id", "archived_date_sum", "available_sum", "added_date_sum"],
             ].copy()
 
             to_update = to_update.rename(
@@ -344,10 +308,10 @@ def main() -> dict:
                 conn.execute(
                     text("""
                         CREATE TEMP TABLE tmp_geo_update (
-                            internal_id  BIGINT PRIMARY KEY,
+                            internal_id BIGINT PRIMARY KEY,
                             archived_date DATE,
-                            available     BOOLEAN,
-                            added_date    DATE
+                            available BOOLEAN,
+                            added_date DATE
                         ) ON COMMIT DROP
                     """)
                 )
@@ -377,40 +341,35 @@ def main() -> dict:
                     if (hasattr(res, "rowcount") and res.rowcount and res.rowcount > 0)
                     else len(to_update)
                 )
-                log.info(f"updated: {rows_updated}")
+                log.info(f"updated_rows={rows_updated}")
             else:
-                log.info("updated: 0")
+                log.info("updated_rows=0")
 
-            # ---------- SANITY ----------
+            # === SANITY ===
             after = _count_geo(conn)
 
-            # 1) mass-balance check
             if after != before + rows_inserted:
                 sanity_problems.append(
-                    f"mass-balance: after({after}) != before({before}) + inserted({rows_inserted})"
+                    f"mass_balance_mismatch: after({after}) != before({before}) + inserted({rows_inserted})"
                 )
 
-            # 2) unique internal_id
             try:
                 dupes = int(
                     conn.execute(
                         text("""
-                            SELECT COUNT(*) - COUNT(DISTINCT internal_id) AS dupes
+                            SELECT COUNT(*) - COUNT(DISTINCT internal_id)
                             FROM silver.summarized_geo
                         """)
                     ).scalar()
                     or 0
                 )
                 if dupes > 0:
-                    sanity_problems.append(
-                        f"dupes in summarized_geo.internal_id: {dupes}"
-                    )
+                    sanity_problems.append(f"dupes_internal_id={dupes}")
                 else:
-                    log.info("sanity: unique internal_id OK")
+                    log.info("sanity:unique_internal_id=ok")
             except Exception as e:
-                sanity_warnings.append(f"unique check skipped: {e}")
+                sanity_warnings.append(f"unique_check_error:{e}")
 
-            # 3) FK coverage
             try:
                 missing_fk = int(
                     conn.execute(
@@ -425,13 +384,12 @@ def main() -> dict:
                     or 0
                 )
                 if missing_fk > 0:
-                    sanity_problems.append(
-                        f"fk coverage: {missing_fk} rows in geo without parent in summarized"
-                    )
+                    sanity_problems.append(f"fk_mismatch={missing_fk}")
                 else:
-                    log.info("sanity: fk coverage OK")
+                    log.info("sanity:fk_coverage=ok")
             except Exception as e:
-                sanity_warnings.append(f"fk check skipped: {e}")
+                sanity_warnings.append(f"fk_check_error:{e}")
+
             try:
                 in_garbage = int(
                     conn.execute(
@@ -444,21 +402,21 @@ def main() -> dict:
                     or 0
                 )
                 if in_garbage > 0:
-                    sanity_problems.append(
-                        f"garbage leak: {in_garbage} rows present in summarized_geo"
-                    )
+                    sanity_problems.append(f"garbage_leak={in_garbage}")
                 else:
-                    log.info("sanity: garbage exclusion OK")
+                    log.info("sanity:garbage_exclusion=ok")
             except Exception as e:
-                sanity_warnings.append(f"garbage check skipped: {e}")
+                sanity_warnings.append(f"garbage_check_error:{e}")
+
             if expected_to_insert != rows_inserted:
                 sanity_warnings.append(
-                    f"expected_to_insert({expected_to_insert}) != rows_inserted({rows_inserted})"
+                    f"insert_mismatch:expected({expected_to_insert})!=actual({rows_inserted})"
                 )
             else:
-                log.info("sanity: expected_to_insert matches rows_inserted")
+                log.info("sanity:insert_count_match=ok")
 
         elapsed = round(time.perf_counter() - t0, 3)
+
         out = {
             "module": "geo_sync",
             "ok": len(sanity_problems) == 0,
@@ -467,7 +425,6 @@ def main() -> dict:
             "before": before,
             "after": after,
             "elapsed_s": elapsed,
-            "sanity_ok": len(sanity_problems) == 0,
             "sanity_problems": sanity_problems,
             "sanity_warnings": sanity_warnings,
         }
@@ -475,32 +432,12 @@ def main() -> dict:
         return out
 
     except SQLAlchemyError as e:
-        log.error(f"failed: {e}")
-        sys.stdout.write(
-            json.dumps(
-                {
-                    "module": "geo_sync",
-                    "ok": False,
-                    "error": str(e),
-                },
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
+        log.error(f"db_error:{e}")
+        sys.stdout.write(json.dumps({"module": "geo_sync", "ok": False, "error": str(e)}) + "\n")
         raise
     except Exception as e:
-        log.error(f"unexpected: {e}")
-        sys.stdout.write(
-            json.dumps(
-                {
-                    "module": "geo_sync",
-                    "ok": False,
-                    "error": str(e),
-                },
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
+        log.error(f"unexpected:{e}")
+        sys.stdout.write(json.dumps({"module": "geo_sync", "ok": False, "error": str(e)}) + "\n")
         raise
 
 

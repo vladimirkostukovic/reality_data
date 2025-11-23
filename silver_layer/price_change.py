@@ -31,7 +31,6 @@ TARGET = "price_change"
 
 # ==== UTILS ====
 def ensure_ingested_at(conn):
-    """Add ingested_at column if it doesn't exist"""
     exists = conn.execute(text("""
         SELECT 1
         FROM information_schema.columns
@@ -47,7 +46,6 @@ def ensure_ingested_at(conn):
         conn.execute(text(f"ALTER TABLE {SCHEMA}.{TARGET} ALTER COLUMN ingested_at DROP DEFAULT"))
 
 def ensure_target_indexes(conn):
-    """Create composite index for efficient duplicate checking"""
     conn.execute(text(f"""
         CREATE INDEX IF NOT EXISTS ix_{SCHEMA}_{TARGET}_pk3
         ON {SCHEMA}.{TARGET} ((id::text), change_date, source_id)
@@ -57,7 +55,6 @@ def count_target(conn) -> int:
     return int(conn.execute(text(f"SELECT COUNT(*) FROM {SCHEMA}.{TARGET}")).scalar() or 0)
 
 def _process_df(df: pd.DataFrame, source_id: int) -> pd.DataFrame:
-    """Clean and validate dataframe from a single source"""
     if df is None or df.empty:
         return pd.DataFrame(columns=["id", "old_price", "new_price", "change_date", "source_id"])
 
@@ -97,10 +94,6 @@ def load_source(conn, sql: str, label: str) -> pd.DataFrame:
     return df
 
 def stage_and_insert(conn, df: pd.DataFrame) -> int:
-    """
-    Stage data in temp table and insert only new records.
-    Uniqueness is determined by (id::text, change_date, source_id).
-    """
     if df.empty:
         return 0
 
@@ -119,6 +112,7 @@ def stage_and_insert(conn, df: pd.DataFrame) -> int:
 
     df.to_sql("tmp_price_stage", con=conn, if_exists="append",
               index=False, method="multi", chunksize=50_000)
+
     conn.execute(text("ANALYZE tmp_price_stage"))
 
     res = conn.execute(text(f"""
@@ -133,14 +127,13 @@ def stage_and_insert(conn, df: pd.DataFrame) -> int:
               AND s.source_id = t.source_id
         )
     """))
+
     return res.rowcount or 0
 
+# ==== MAIN ====
 def main():
     t0 = time.perf_counter()
-    inserted = 0
-    staged = 0
-    before = None
-    after = None
+    before = after = staged = inserted = 0
 
     try:
         with engine.begin() as conn:
@@ -159,7 +152,6 @@ def main():
 
             df = pd.concat([df1, df2, df3], ignore_index=True)
             staged = len(df)
-            log.info(f"concat: total_rows={staged}")
 
             b = len(df)
             df = df.drop_duplicates(subset=["id", "change_date", "source_id"], keep="last")
@@ -167,44 +159,41 @@ def main():
                 log.info(f"dedup:global_dups={b - len(df)}")
 
             if df.empty:
-                log.info("nothing_to_insert")
                 after = count_target(conn)
                 out = {
                     "module": "price_change_sync",
-                    "staged": 0,
-                    "inserted": 0,
                     "before": int(before),
                     "after": int(after),
+                    "staged": 0,
+                    "inserted": 0,
+                    "status": "ok",
                     "elapsed_s": round(time.perf_counter() - t0, 3)
                 }
                 sys.stdout.write(json.dumps(out) + "\n")
                 return
 
-            log.info(f"insert: try_rows={len(df)}")
             inserted = stage_and_insert(conn, df)
-            log.info(f"inserted={inserted}")
-
             after = count_target(conn)
-            if after != before + inserted:
-                log.warning("mass-balance mismatch: after(%d) != before(%d) + inserted(%d)", after, before, inserted)
 
         out = {
             "module": "price_change_sync",
-            "staged": int(staged),
-            "inserted": int(inserted),
             "before": int(before),
             "after": int(after),
+            "staged": int(staged),
+            "inserted": int(inserted),
+            "status": "ok",
             "elapsed_s": round(time.perf_counter() - t0, 3)
         }
         sys.stdout.write(json.dumps(out) + "\n")
 
-    except SQLAlchemyError as e:
-        log.error(f"db_error: {e}")
-        sys.stdout.write(json.dumps({"module": "price_change_sync", "error": str(e)}) + "\n")
-        raise
     except Exception as e:
         log.error(f"unexpected: {e}")
-        sys.stdout.write(json.dumps({"module": "price_change_sync", "error": str(e)}) + "\n")
+        sys.stdout.write(json.dumps({
+            "module": "price_change_sync",
+            "error": str(e),
+            "status": "fail",
+            "elapsed_s": round(time.perf_counter() - t0, 3)
+        }) + "\n")
         raise
 
 if __name__ == "__main__":

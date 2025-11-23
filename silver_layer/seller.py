@@ -1,3 +1,6 @@
+# Extracts and normalizes seller metadata from all sources into silver.seller using SQL + streaming pipelines.
+# Performs staging, dedup, idempotent merge and outputs strict JSON metrics for the orchestrator.
+
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -45,7 +48,6 @@ FLUSH_SIZE = 25_000
 
 # === PARSER ===
 def parse_seller_info(raw) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """Parse seller_info string to extract agent_name, phone, email, and agency"""
     if raw is None:
         return None, None, None, None
     try:
@@ -71,7 +73,6 @@ def parse_seller_info(raw) -> Tuple[Optional[str], Optional[str], Optional[str],
 
 # === DB HELPERS ===
 def insert_stage_and_merge(conn, rows: List[Tuple[str, Optional[str], Optional[str], Optional[str]]], label: str) -> int:
-    """Stage batch in temp table and merge into silver.seller for new IDs only"""
     if not rows:
         return 0
 
@@ -97,7 +98,6 @@ def insert_stage_and_merge(conn, rows: List[Tuple[str, Optional[str], Optional[s
             page_size=50_000
         )
 
-        cur.execute("DROP TABLE IF EXISTS tmp_seller_stage_dedup;")
         cur.execute("""
             CREATE TEMP TABLE tmp_seller_stage_dedup AS
             SELECT DISTINCT ON (id) id, agent_name, agent_phone, agent_email
@@ -113,79 +113,71 @@ def insert_stage_and_merge(conn, rows: List[Tuple[str, Optional[str], Optional[s
         """)
         inserted = cur.rowcount or 0
 
-        cur.execute("DROP TABLE IF EXISTS tmp_seller_stage_dedup;")
-        cur.execute("DROP TABLE IF EXISTS tmp_seller_stage;")
-
     return inserted
 
 # === SYNC: SREALITY ===
 def sync_from_sreality_sqlalchemy(sa_conn) -> int:
-    """Sync seller data from sreality_seller table using pure SQL"""
     log.info("load:sreality_seller")
     res = sa_conn.execute(text("""
         INSERT INTO silver.seller (id, agent_name, agent_phone, agent_email)
-        SELECT CAST(id AS TEXT) AS id,
-               NULLIF(trim(agent_name), '') AS agent_name,
-               NULLIF(trim(agent_phone), '') AS agent_phone,
-               NULLIF(trim(agent_email), '') AS agent_email
+        SELECT CAST(id AS TEXT),
+               NULLIF(trim(agent_name), ''),
+               NULLIF(trim(agent_phone), ''),
+               NULLIF(trim(agent_email), '')
         FROM sreality_seller s
         WHERE (NULLIF(trim(agent_email), '') IS NOT NULL OR NULLIF(trim(agent_phone), '') IS NOT NULL)
           AND NOT EXISTS (SELECT 1 FROM silver.seller t WHERE t.id = CAST(s.id AS TEXT))
     """))
-    inserted = res.rowcount or 0
-    log.info(f"inserted:sreality={inserted}")
-    return inserted
+    return res.rowcount or 0
 
 # === SYNC: IDNES ===
 def sync_from_idnes_psycopg2(raw_conn) -> int:
-    """Sync seller data from idnes_seller table using streaming psycopg2"""
     log.info("load:idnes_seller (streaming psycopg2)")
     inserted_total = 0
-    seen = 0
-    buf: List[Tuple[str, Optional[str], Optional[str], Optional[str]]] = []
+    buf = []
 
     with raw_conn.cursor(name=None) as cur:
         cur.itersize = FETCH_SIZE
         cur.execute("SELECT id, seller_info FROM idnes_seller;")
+
         while True:
             rows = cur.fetchmany(FETCH_SIZE)
             if not rows:
                 break
+
             for _id, info in rows:
-                seen += 1
                 a, ph, em, _ag = parse_seller_info(info)
                 if (em and em.strip()) or (ph and ph.strip()):
                     buf.append((str(_id), a, ph, em))
+
                 if len(buf) >= FLUSH_SIZE:
                     inserted_total += insert_stage_and_merge(raw_conn, buf, "idnes")
                     buf.clear()
 
     if buf:
         inserted_total += insert_stage_and_merge(raw_conn, buf, "idnes")
-        buf.clear()
 
-    log.info(f"parse:idnes seen={seen} inserted={inserted_total}")
     return inserted_total
 
 # === MAIN ===
 def main():
     t0 = time.perf_counter()
+
+    rows_inserted = {"sreality": 0, "idnes": 0}
+    before = after = 0
     sanity_problems = []
     sanity_warnings = []
-
-    rows = {"sreality": 0, "idnes": 0}
-    before = after = 0
 
     try:
         with engine.begin() as sa_conn:
             before = sa_conn.execute(text("SELECT COUNT(*) FROM silver.seller")).scalar() or 0
 
         with engine.begin() as sa_conn:
-            rows["sreality"] = sync_from_sreality_sqlalchemy(sa_conn)
+            rows_inserted["sreality"] = sync_from_sreality_sqlalchemy(sa_conn)
 
         with psycopg2.connect(DSN) as raw_conn:
             raw_conn.autocommit = False
-            rows["idnes"] = sync_from_idnes_psycopg2(raw_conn)
+            rows_inserted["idnes"] = sync_from_idnes_psycopg2(raw_conn)
             raw_conn.commit()
 
         with engine.begin() as sa_conn:
@@ -193,38 +185,40 @@ def main():
 
             if after < before:
                 sanity_problems.append(f"rowcount decreased: before={before}, after={after}")
-            if sum(rows.values()) != after - before:
-                sanity_warnings.append(f"mass mismatch: inserted={sum(rows.values())}, delta={after - before}")
 
-            dupes = sa_conn.execute(text("SELECT COUNT(*) - COUNT(DISTINCT id) FROM silver.seller")).scalar() or 0
+            if (rows_inserted["sreality"] + rows_inserted["idnes"]) != (after - before):
+                sanity_warnings.append(
+                    f"mass mismatch: inserted={rows_inserted}, delta={after - before}"
+                )
+
+            dupes = sa_conn.execute(text(
+                "SELECT COUNT(*) - COUNT(DISTINCT id) FROM silver.seller"
+            )).scalar() or 0
             if dupes > 0:
                 sanity_problems.append(f"duplicate ids={dupes}")
 
-        elapsed = round(time.perf_counter() - t0, 3)
+        # ==== JSON OUTPUT ====
         out = {
             "module": "seller_sync",
-            "ok": len(sanity_problems) == 0,
-            "rows_inserted": rows,
+            "status": "ok" if not sanity_problems else "fail",
             "before": before,
             "after": after,
-            "elapsed_s": elapsed,
-            "sanity_ok": len(sanity_problems) == 0,
+            "inserted_total": rows_inserted["sreality"] + rows_inserted["idnes"],
+            "inserted_breakdown": rows_inserted,
             "sanity_problems": sanity_problems,
             "sanity_warnings": sanity_warnings,
+            "elapsed_s": round(time.perf_counter() - t0, 3),
         }
         sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
 
-    except SQLAlchemyError as e:
-        log.error(f"db_error: {e}")
-        sys.stdout.write(json.dumps({"module": "seller_sync", "ok": False, "error": str(e)}) + "\n")
-        raise
-    except psycopg2.Error as e:
-        log.error(f"psycopg2_error: {e}")
-        sys.stdout.write(json.dumps({"module": "seller_sync", "ok": False, "error": str(e)}) + "\n")
-        raise
     except Exception as e:
         log.error(f"unexpected: {e}")
-        sys.stdout.write(json.dumps({"module": "seller_sync", "ok": False, "error": str(e)}) + "\n")
+        sys.stdout.write(json.dumps({
+            "module": "seller_sync",
+            "status": "fail",
+            "error": str(e),
+            "elapsed_s": round(time.perf_counter() - t0, 3),
+        }) + "\n")
         raise
 
 if __name__ == "__main__":
