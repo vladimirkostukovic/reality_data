@@ -1,16 +1,19 @@
-
 from __future__ import annotations
 import json
 import logging
+import sys
 import time
 from pathlib import Path
+from datetime import datetime
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
 # ---------- LOGGING ----------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | reality_flat | %(message)s"
+    format="%(asctime)s | %(levelname)s | reality_flat | %(message)s",
+    handlers=[logging.StreamHandler(sys.stderr)],
+    force=True
 )
 log = logging.getLogger("reality_flat")
 
@@ -160,6 +163,24 @@ LEFT JOIN speed sp
   AND sp.rooms_bucket    = n.rooms_bucket
 """
 
+def _pg_diag_payload(exc: Exception):
+    d = {"type": type(exc).__name__}
+    orig = getattr(exc, "orig", None)
+    if orig is not None:
+        d["pgcode"] = getattr(orig, "pgcode", None)
+        d["pgerror"] = getattr(orig, "pgerror", None)
+        diag = getattr(orig, "diag", None)
+        if diag:
+            for k in ("schema_name", "table_name", "column_name", "datatype_name",
+                      "constraint_name", "message_primary", "message_detail", "context"):
+                v = getattr(diag, k, None)
+                if v:
+                    d[k] = str(v)
+    stmt = getattr(exc, "statement", None)
+    if stmt:
+        d["statement_preview"] = stmt[:300]
+    return d
+
 def fq(schema: str, table: str) -> str:
     return f'"{schema}"."{table}"'
 
@@ -170,7 +191,6 @@ def schema_exists(conn, schema: str) -> bool:
     ).scalar())
 
 def build_stage(conn):
-    log.info("build stage table (gold.totalized -> flat)")
     conn.execute(text(f'DROP TABLE IF EXISTS {fq(TARGET_SCHEMA, STAGE_TABLE)}'))
     conn.execute(text(f"""
         CREATE TABLE {fq(TARGET_SCHEMA, STAGE_TABLE)} AS
@@ -178,11 +198,10 @@ def build_stage(conn):
     """))
 
 def finalize(conn):
-    log.info("swap stage -> final")
     conn.execute(text(f'DROP TABLE IF EXISTS {fq(TARGET_SCHEMA, TARGET_TABLE)}'))
     conn.execute(text(f'ALTER TABLE {fq(TARGET_SCHEMA, STAGE_TABLE)} RENAME TO "{TARGET_TABLE}"'))
 
-    #-- индексы под фильтры и слайсеры
+    # индексы под фильтры и слайсеры
     conn.execute(text(f'CREATE INDEX IF NOT EXISTS {TARGET_TABLE}_deal_type_idx        ON {fq(TARGET_SCHEMA, TARGET_TABLE)} (deal_type)'))
     conn.execute(text(f'CREATE INDEX IF NOT EXISTS {TARGET_TABLE}_region_idx           ON {fq(TARGET_SCHEMA, TARGET_TABLE)} (norm_district)'))
     conn.execute(text(f'CREATE INDEX IF NOT EXISTS {TARGET_TABLE}_rooms_bucket_idx     ON {fq(TARGET_SCHEMA, TARGET_TABLE)} (rooms_bucket)'))
@@ -192,7 +211,12 @@ def finalize(conn):
     conn.execute(text(f'ANALYZE {fq(TARGET_SCHEMA, TARGET_TABLE)}'))
 
 def main():
-    t0 = time.perf_counter()
+    result = {
+        "status": "success",
+        "rows_created": 0,
+        "timestamp": datetime.now().isoformat()
+    }
+
     try:
         with engine.begin() as conn:
             if not schema_exists(conn, TARGET_SCHEMA):
@@ -205,22 +229,20 @@ def main():
                 text(f"SELECT COUNT(*) FROM {fq(TARGET_SCHEMA, TARGET_TABLE)}")
             ).scalar()
 
-            elapsed = round(time.perf_counter() - t0, 3)
-            print(json.dumps({
-                "ok": True,
-                "table": f"{TARGET_SCHEMA}.{TARGET_TABLE}",
-                "rows": int(rows_cnt or 0),
-                "elapsed_s": elapsed
-            }, ensure_ascii=False))
+            result["rows_created"] = int(rows_cnt or 0)
 
     except SQLAlchemyError as e:
-        log.exception("db error")
-        print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
-        raise
+        result["status"] = "error"
+        result["error"] = _pg_diag_payload(e)
+        print(json.dumps(result, ensure_ascii=False))
+        sys.exit(1)
     except Exception as e:
-        log.exception("unexpected")
-        print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
-        raise
+        result["status"] = "error"
+        result["error"] = {"type": type(e).__name__, "message": str(e)[:500]}
+        print(json.dumps(result, ensure_ascii=False))
+        sys.exit(1)
+
+    print(json.dumps(result, ensure_ascii=False))
 
 if __name__ == "__main__":
     main()

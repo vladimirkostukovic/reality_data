@@ -1,15 +1,20 @@
 from __future__ import annotations
 import json
 import logging
+import sys
 import time
 from pathlib import Path
 from typing import List, Dict, Tuple
+from datetime import datetime
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
 # ---------- LOGGING ----------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | bi_star | %(message)s"
+    format="%(asctime)s | %(levelname)s | bi_star | %(message)s",
+    handlers=[logging.StreamHandler(sys.stderr)],
+    force=True
 )
 log = logging.getLogger("bi_star")
 
@@ -18,18 +23,39 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 cfg = json.loads((PROJECT_ROOT / "config.json").read_text(encoding="utf-8"))
 
 db_user = cfg.get("user") or cfg.get("USER")
-db_pwd  = cfg.get("password") or cfg.get("PWD")
+db_pwd = cfg.get("password") or cfg.get("PWD")
 db_host = cfg.get("host") or cfg.get("HOST")
 db_port = cfg.get("port") or cfg.get("PORT")
 db_name = cfg.get("dbname") or cfg.get("DB")
-DB_URL  = f"postgresql+psycopg2://{db_user}:{db_pwd}@{db_host}:{db_port}/{db_name}"
-engine  = create_engine(DB_URL, pool_pre_ping=True, connect_args={"connect_timeout": 10})
+DB_URL = f"postgresql+psycopg2://{db_user}:{db_pwd}@{db_host}:{db_port}/{db_name}"
+engine = create_engine(DB_URL, pool_pre_ping=True, connect_args={"connect_timeout": 10})
 
 BI_SCHEMA = "bi_reality_data"
 
+
 # ---------- UTILS ----------
+def _pg_diag_payload(exc: Exception):
+    d = {"type": type(exc).__name__}
+    orig = getattr(exc, "orig", None)
+    if orig is not None:
+        d["pgcode"] = getattr(orig, "pgcode", None)
+        d["pgerror"] = getattr(orig, "pgerror", None)
+        diag = getattr(orig, "diag", None)
+        if diag:
+            for k in ("schema_name", "table_name", "column_name", "datatype_name",
+                      "constraint_name", "message_primary", "message_detail", "context"):
+                v = getattr(diag, k, None)
+                if v:
+                    d[k] = str(v)
+    stmt = getattr(exc, "statement", None)
+    if stmt:
+        d["statement_preview"] = stmt[:300]
+    return d
+
+
 def fq(schema: str, name: str) -> str:
     return f'"{schema}"."{name}"'
+
 
 def schema_exists(conn, schema: str) -> bool:
     return bool(conn.execute(
@@ -37,19 +63,23 @@ def schema_exists(conn, schema: str) -> bool:
         {"s": schema}
     ).scalar())
 
+
 def table_exists(conn, schema: str, name: str) -> bool:
     return bool(conn.execute(
         text("SELECT to_regclass(:r) IS NOT NULL"),
         {"r": f"{schema}.{name}"}
     ).scalar())
 
+
 def count_rows(conn, schema: str, table: str) -> int:
     return int(conn.execute(text(f"SELECT COUNT(*) FROM {fq(schema, table)}")).scalar() or 0)
+
 
 def publish_table(conn, schema: str, target: str, stage: str):
     conn.execute(text(f'DROP TABLE IF EXISTS {fq(schema, target)}'))
     conn.execute(text(f'ALTER TABLE {fq(schema, stage)} RENAME TO "{target}"'))
     conn.execute(text(f'ANALYZE {fq(schema, target)}'))
+
 
 # ---------- NORMALIZATION / SPLITS ----------
 DEAL_TYPE_NORMALIZE_SQL = """
@@ -71,8 +101,9 @@ CASE
 END
 """
 
-DEALS:   List[str] = ["prodej", "pronajem", "drazba"]
+DEALS: List[str] = ["prodej", "pronajem", "drazba"]
 BUCKETS: List[str] = ["byty", "domy", "pozemky", "komercni", "ostatni"]
+
 
 # ---------- DIMENSIONS ----------
 def rebuild_dim_date(conn) -> int:
@@ -111,6 +142,7 @@ def rebuild_dim_date(conn) -> int:
     conn.execute(text(f'ALTER TABLE {fq(BI_SCHEMA, "dim_date")} ADD PRIMARY KEY (date_key)'))
     return count_rows(conn, BI_SCHEMA, "dim_date")
 
+
 def rebuild_dim_geo(conn) -> int:
     stage = "dim_geo__stage"
     conn.execute(text(f'DROP TABLE IF EXISTS {fq(BI_SCHEMA, stage)}'))
@@ -118,8 +150,8 @@ def rebuild_dim_geo(conn) -> int:
         CREATE TABLE {fq(BI_SCHEMA, stage)} AS
         WITH src AS (
           SELECT DISTINCT
-            NULLIF(trim(norm_district),    '') AS region_name,    -- kraje
-            NULLIF(trim(norm_okres),       '') AS district_name,  -- okresy
+            NULLIF(trim(norm_district),    '') AS region_name,
+            NULLIF(trim(norm_okres),       '') AS district_name,
             NULLIF(trim(norm_city),        '') AS city_name,
             NULLIF(trim(norm_city_part),   '') AS city_part_name,
             NULLIF(trim(norm_street),      '') AS street_name,
@@ -144,7 +176,6 @@ def rebuild_dim_geo(conn) -> int:
           FROM src
         ),
         dedup AS (
-          /* один ряд на набор норм-ключей; оригиналы берём детерминированно */
           SELECT
             MIN(region)       AS region,
             MIN(district)     AS district,
@@ -180,6 +211,7 @@ def rebuild_dim_geo(conn) -> int:
     conn.execute(text(f'CREATE INDEX IF NOT EXISTS dim_geo_street_idx   ON {fq(BI_SCHEMA, "dim_geo")} (street)'))
     return count_rows(conn, BI_SCHEMA, "dim_geo")
 
+
 def rebuild_dim_seller(conn) -> int:
     stage = "dim_seller__stage"
     conn.execute(text(f'DROP TABLE IF EXISTS {fq(BI_SCHEMA, stage)}'))
@@ -201,6 +233,7 @@ def rebuild_dim_seller(conn) -> int:
         ON {fq(BI_SCHEMA, "dim_seller")} (seller_name, seller_type, seller_domain, phone_norm, email_norm)
     '''))
     return count_rows(conn, BI_SCHEMA, "dim_seller")
+
 
 def rebuild_dim_object(conn) -> int:
     stage = "dim_object__stage"
@@ -228,17 +261,19 @@ def rebuild_dim_object(conn) -> int:
     conn.execute(text(f'ALTER TABLE {fq(BI_SCHEMA, "dim_object")} ADD PRIMARY KEY (object_id)'))
     return count_rows(conn, BI_SCHEMA, "dim_object")
 
+
 # ---------- FACTS: ACTIVE / CLOSED ----------
 G_JOIN_REGION = "lower(regexp_replace(COALESCE(r.norm_district,'Neznámý kraj'),  '\\\\s+',' ','g'))"
-G_JOIN_DIST   = "lower(regexp_replace(COALESCE(r.norm_okres,'Neznámý okres'),    '\\\\s+',' ','g'))"
-G_JOIN_CITY   = "lower(regexp_replace(COALESCE(r.norm_city,''),                  '\\\\s+',' ','g'))"
-G_JOIN_PART   = "lower(regexp_replace(COALESCE(r.norm_city_part,''),             '\\\\s+',' ','g'))"
+G_JOIN_DIST = "lower(regexp_replace(COALESCE(r.norm_okres,'Neznámý okres'),    '\\\\s+',' ','g'))"
+G_JOIN_CITY = "lower(regexp_replace(COALESCE(r.norm_city,''),                  '\\\\s+',' ','g'))"
+G_JOIN_PART = "lower(regexp_replace(COALESCE(r.norm_city_part,''),             '\\\\s+',' ','g'))"
 G_JOIN_STREET = "lower(regexp_replace(COALESCE(r.norm_street,''),                '\\\\s+',' ','g'))"
-G_JOIN_HNO    = "lower(regexp_replace(COALESCE(r.norm_house_number,''),          '\\\\s+','',  'g'))"
+G_JOIN_HNO = "lower(regexp_replace(COALESCE(r.norm_house_number,''),          '\\\\s+','',  'g'))"
+
 
 def _fact_sql(is_closed: bool) -> str:
     select_closed = "t.archived_date::date  AS archived_date," if is_closed else ""
-    order_tail    = ", r.archived_date" if is_closed else ""
+    order_tail = ", r.archived_date" if is_closed else ""
     return f"""
         WITH base AS (
           SELECT
@@ -280,7 +315,7 @@ def _fact_sql(is_closed: bool) -> str:
           ) z
           WHERE rn = 1
         ),
-        g1 AS ( -- strict: street + house_number
+        g1 AS (
           SELECT r.object_id, g.geo_key
           FROM rep r
           LEFT JOIN {fq(BI_SCHEMA, "dim_geo")} g
@@ -291,7 +326,7 @@ def _fact_sql(is_closed: bool) -> str:
            AND g.street_norm       = {G_JOIN_STREET}
            AND g.house_number_norm = {G_JOIN_HNO}
         ),
-        g2 AS ( -- street only (без номера дома)
+        g2 AS (
           SELECT r.object_id, g.geo_key
           FROM rep r
           LEFT JOIN {fq(BI_SCHEMA, "dim_geo")} g
@@ -302,7 +337,7 @@ def _fact_sql(is_closed: bool) -> str:
            AND g.street_norm       = {G_JOIN_STREET}
            AND g.house_number_norm = ''
         ),
-        g3 AS ( -- без улицы (только иерархия)
+        g3 AS (
           SELECT r.object_id, g.geo_key
           FROM rep r
           LEFT JOIN {fq(BI_SCHEMA, "dim_geo")} g
@@ -313,7 +348,7 @@ def _fact_sql(is_closed: bool) -> str:
            AND g.street_norm       = ''
            AND g.house_number_norm = ''
         ),
-        g4 AS ( -- более грубая иерархия (без city_part)
+        g4 AS (
           SELECT r.object_id, g.geo_key
           FROM rep r
           LEFT JOIN {fq(BI_SCHEMA, "dim_geo")} g
@@ -348,6 +383,7 @@ def _fact_sql(is_closed: bool) -> str:
         ORDER BY r.object_id, r.added_date{order_tail};
     """
 
+
 def rebuild_fact_active(conn) -> int:
     stage = "fact_active__stage"
     conn.execute(text(f'DROP TABLE IF EXISTS {fq(BI_SCHEMA, stage)}'))
@@ -355,10 +391,12 @@ def rebuild_fact_active(conn) -> int:
     publish_table(conn, BI_SCHEMA, "fact_active", stage)
     conn.execute(text(f'ALTER TABLE {fq(BI_SCHEMA, "fact_active")} ALTER COLUMN added_date SET NOT NULL'))
     conn.execute(text(f'ALTER TABLE {fq(BI_SCHEMA, "fact_active")} ADD PRIMARY KEY (object_id, added_date)'))
-    conn.execute(text(f'CREATE INDEX IF NOT EXISTS fact_active_deal_idx  ON {fq(BI_SCHEMA, "fact_active")} (deal_type)'))
+    conn.execute(
+        text(f'CREATE INDEX IF NOT EXISTS fact_active_deal_idx  ON {fq(BI_SCHEMA, "fact_active")} (deal_type)'))
     conn.execute(text(f'CREATE INDEX IF NOT EXISTS fact_active_geo_idx   ON {fq(BI_SCHEMA, "fact_active")} (geo_key)'))
     conn.execute(text(f'CREATE INDEX IF NOT EXISTS fact_active_price_idx ON {fq(BI_SCHEMA, "fact_active")} (price)'))
     return count_rows(conn, BI_SCHEMA, "fact_active")
+
 
 def rebuild_fact_closed(conn) -> int:
     stage = "fact_closed__stage"
@@ -368,10 +406,12 @@ def rebuild_fact_closed(conn) -> int:
     conn.execute(text(f'ALTER TABLE {fq(BI_SCHEMA, "fact_closed")} ALTER COLUMN added_date SET NOT NULL'))
     conn.execute(text(f'ALTER TABLE {fq(BI_SCHEMA, "fact_closed")} ALTER COLUMN archived_date SET NOT NULL'))
     conn.execute(text(f'ALTER TABLE {fq(BI_SCHEMA, "fact_closed")} ADD PRIMARY KEY (object_id, added_date)'))
-    conn.execute(text(f'CREATE INDEX IF NOT EXISTS fact_closed_deal_idx  ON {fq(BI_SCHEMA, "fact_closed")} (deal_type)'))
+    conn.execute(
+        text(f'CREATE INDEX IF NOT EXISTS fact_closed_deal_idx  ON {fq(BI_SCHEMA, "fact_closed")} (deal_type)'))
     conn.execute(text(f'CREATE INDEX IF NOT EXISTS fact_closed_geo_idx   ON {fq(BI_SCHEMA, "fact_closed")} (geo_key)'))
     conn.execute(text(f'CREATE INDEX IF NOT EXISTS fact_closed_price_idx ON {fq(BI_SCHEMA, "fact_closed")} (price)'))
     return count_rows(conn, BI_SCHEMA, "fact_closed")
+
 
 # ---------- SPLITS ----------
 def rebuild_split_active(conn) -> Dict[str, int]:
@@ -380,7 +420,7 @@ def rebuild_split_active(conn) -> Dict[str, int]:
         raise RuntimeError("fact_active is missing; build it first")
     for deal in DEALS:
         for bucket in BUCKETS:
-            stage  = f"fact_active_{deal}_{bucket}__stage"
+            stage = f"fact_active_{deal}_{bucket}__stage"
             target = f"fact_active_{deal}_{bucket}"
             cnt = conn.execute(text(f"""
                 SELECT COUNT(*) FROM {fq(BI_SCHEMA, "fact_active")}
@@ -407,13 +447,14 @@ def rebuild_split_active(conn) -> Dict[str, int]:
             stats[f"rows_{target}"] = count_rows(conn, BI_SCHEMA, target)
     return stats
 
+
 def rebuild_split_closed(conn) -> Dict[str, int]:
     stats: Dict[str, int] = {}
     if not table_exists(conn, BI_SCHEMA, "fact_closed"):
         raise RuntimeError("fact_closed is missing; build it first")
     for deal in DEALS:
         for bucket in BUCKETS:
-            stage  = f"fact_closed_{deal}_{bucket}__stage"
+            stage = f"fact_closed_{deal}_{bucket}__stage"
             target = f"fact_closed_{deal}_{bucket}"
             cnt = conn.execute(text(f"""
                 SELECT COUNT(*) FROM {fq(BI_SCHEMA, "fact_closed")}
@@ -440,6 +481,7 @@ def rebuild_split_closed(conn) -> Dict[str, int]:
             stats[f"rows_{target}"] = count_rows(conn, BI_SCHEMA, target)
     return stats
 
+
 # ---------- SANITY CHECKS ----------
 def run_sanity_checks(conn) -> Tuple[bool, Dict[str, int]]:
     stats: Dict[str, int] = {}
@@ -458,9 +500,9 @@ def run_sanity_checks(conn) -> Tuple[bool, Dict[str, int]]:
 
     union_distinct = int(conn.execute(text(f"""
         SELECT COUNT(DISTINCT object_id) FROM (
-          SELECT object_id FROM {fq(BI_SCHEMA,'fact_active')}
+          SELECT object_id FROM {fq(BI_SCHEMA, 'fact_active')}
           UNION
-          SELECT object_id FROM {fq(BI_SCHEMA,'fact_closed')}
+          SELECT object_id FROM {fq(BI_SCHEMA, 'fact_closed')}
         ) u
     """)).scalar() or 0)
     stats["facts_union_distinct_objects"] = union_distinct
@@ -468,8 +510,8 @@ def run_sanity_checks(conn) -> Tuple[bool, Dict[str, int]]:
     intersect_cnt = int(conn.execute(text(f"""
         SELECT COUNT(*) FROM (
           SELECT a.object_id
-          FROM {fq(BI_SCHEMA,'fact_active')} a
-          INNER JOIN {fq(BI_SCHEMA,'fact_closed')} c
+          FROM {fq(BI_SCHEMA, 'fact_active')} a
+          INNER JOIN {fq(BI_SCHEMA, 'fact_closed')} c
             ON c.object_id = a.object_id
           GROUP BY a.object_id
         ) z
@@ -480,10 +522,10 @@ def run_sanity_checks(conn) -> Tuple[bool, Dict[str, int]]:
     params = {f"d{i}": d for i, d in enumerate(DEALS)}
 
     active_known = int(conn.execute(
-        text(f"SELECT COUNT(*) FROM {fq(BI_SCHEMA,'fact_active')} WHERE deal_type IN ({placeholders})"),
+        text(f"SELECT COUNT(*) FROM {fq(BI_SCHEMA, 'fact_active')} WHERE deal_type IN ({placeholders})"),
         params).scalar() or 0)
     closed_known = int(conn.execute(
-        text(f"SELECT COUNT(*) FROM {fq(BI_SCHEMA,'fact_closed')} WHERE deal_type IN ({placeholders})"),
+        text(f"SELECT COUNT(*) FROM {fq(BI_SCHEMA, 'fact_closed')} WHERE deal_type IN ({placeholders})"),
         params).scalar() or 0)
 
     stats["fact_active_unknown_deals"] = fa_rows - active_known
@@ -523,14 +565,14 @@ def run_sanity_checks(conn) -> Tuple[bool, Dict[str, int]]:
     if problems:
         top_active = conn.execute(text(f"""
             SELECT deal_type, COUNT(*) AS cnt
-            FROM {fq(BI_SCHEMA,'fact_active')}
+            FROM {fq(BI_SCHEMA, 'fact_active')}
             GROUP BY deal_type
             ORDER BY cnt DESC
             LIMIT 10
         """)).fetchall()
         top_closed = conn.execute(text(f"""
             SELECT deal_type, COUNT(*) AS cnt
-            FROM {fq(BI_SCHEMA,'fact_closed')}
+            FROM {fq(BI_SCHEMA, 'fact_closed')}
             GROUP BY deal_type
             ORDER BY cnt DESC
             LIMIT 10
@@ -542,6 +584,7 @@ def run_sanity_checks(conn) -> Tuple[bool, Dict[str, int]]:
         raise RuntimeError("Sanity check failed: " + " | ".join(problems))
 
     return True, stats
+
 
 # ---------- PRICE EVENTS ----------
 def rebuild_price_change_events(conn) -> int:
@@ -569,45 +612,76 @@ def rebuild_price_change_events(conn) -> int:
         WHERE FALSE
     """))
     publish_table(conn, BI_SCHEMA, "fact_object_price_events", stage)
-    conn.execute(text(f'ALTER TABLE {fq(BI_SCHEMA, "fact_object_price_events")} ADD PRIMARY KEY (object_id, event_date)'))
+    conn.execute(
+        text(f'ALTER TABLE {fq(BI_SCHEMA, "fact_object_price_events")} ADD PRIMARY KEY (object_id, event_date)'))
     return 0
+
 
 # ---------- MAIN ----------
 def main():
-    t0 = time.perf_counter()
+    result = {
+        "status": "success",
+        "dimensions_created": 0,
+        "facts_created": 0,
+        "splits_created": 0,
+        "timestamp": datetime.now().isoformat()
+    }
+
     try:
         with engine.begin() as conn:
             if not schema_exists(conn, BI_SCHEMA):
-                raise RuntimeError(f'schema "{BI_SCHEMA}" not found. Create it manually or change BI_SCHEMA.')
+                raise RuntimeError(f'schema "{BI_SCHEMA}" not found')
 
             ok = conn.execute(text("SELECT to_regclass('gold.totalized') IS NOT NULL")).scalar()
             if not ok:
-                print(json.dumps({"step":"bi_publish_periods","ok":False,"rc":1,"error":"gold.totalized not found"}, ensure_ascii=False))
-                return
+                raise RuntimeError("gold.totalized not found")
 
             stats: Dict[str, int] = {}
-            log.info("Rebuild dim_date");     stats["rows_dim_date"]     = rebuild_dim_date(conn)
-            log.info("Rebuild dim_geo");      stats["rows_dim_geo"]      = rebuild_dim_geo(conn)
-            log.info("Rebuild dim_seller");   stats["rows_dim_seller"]   = rebuild_dim_seller(conn)
-            log.info("Rebuild dim_object");   stats["rows_dim_object"]   = rebuild_dim_object(conn)
 
-            log.info("Rebuild fact_active");  stats["rows_fact_active"]  = rebuild_fact_active(conn)
-            log.info("Rebuild fact_closed");  stats["rows_fact_closed"]  = rebuild_fact_closed(conn)
+            # Dimensions
+            stats["rows_dim_date"] = rebuild_dim_date(conn)
+            stats["rows_dim_geo"] = rebuild_dim_geo(conn)
+            stats["rows_dim_seller"] = rebuild_dim_seller(conn)
+            stats["rows_dim_object"] = rebuild_dim_object(conn)
 
-            log.info("Split ACTIVE");         stats.update(rebuild_split_active(conn))
-            log.info("Split CLOSED");         stats.update(rebuild_split_closed(conn))
+            result["dimensions_created"] = 4
 
-            log.info("Price events stub");    stats["rows_price_events"] = rebuild_price_change_events(conn)
+            # Facts
+            stats["rows_fact_active"] = rebuild_fact_active(conn)
+            stats["rows_fact_closed"] = rebuild_fact_closed(conn)
 
-            log.info("Sanity checks…")
+            result["facts_created"] = 2
+
+            # Splits
+            stats.update(rebuild_split_active(conn))
+            stats.update(rebuild_split_closed(conn))
+
+            splits_count = sum(1 for k in stats.keys() if
+                               k.startswith("rows_fact_") and "_prodej_" in k or "_pronajem_" in k or "_drazba_" in k)
+            result["splits_created"] = splits_count
+
+            # Price events stub
+            stats["rows_price_events"] = rebuild_price_change_events(conn)
+
+            # Sanity checks
             _, sanity = run_sanity_checks(conn)
             stats.update({f"sanity_{k}": v for k, v in sanity.items()})
 
-            elapsed = round(time.perf_counter() - t0, 3)
-            print(json.dumps({"step":"bi_publish_periods","ok":True,"rc":0,"elapsed_s":elapsed,"stats":stats}, ensure_ascii=False))
+            result["stats"] = stats
+
+    except SQLAlchemyError as e:
+        result["status"] = "error"
+        result["error"] = _pg_diag_payload(e)
+        print(json.dumps(result, ensure_ascii=False))
+        sys.exit(1)
     except Exception as e:
-        log.exception(f"gold_to_bi failed: {e}")
-        print(json.dumps({"step":"bi_publish_periods","ok":False,"rc":2,"error":str(e)}, ensure_ascii=False))
+        result["status"] = "error"
+        result["error"] = {"type": type(e).__name__, "message": str(e)[:500]}
+        print(json.dumps(result, ensure_ascii=False))
+        sys.exit(1)
+
+    print(json.dumps(result, ensure_ascii=False))
+
 
 if __name__ == "__main__":
     main()

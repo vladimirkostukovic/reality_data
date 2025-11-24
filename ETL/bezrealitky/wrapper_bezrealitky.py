@@ -34,7 +34,10 @@ def _parse_sync_summaries(stdout: str) -> List[dict]:
         try:
             obj = json.loads(line)
             if isinstance(obj, dict) and obj.get("stage") == "sync_summary":
-                out.append(obj)
+                # ИСПРАВЛЕНИЕ: Берём только stats
+                stats = obj.get("stats")
+                if stats:
+                    out.append(stats)
         except Exception:
             continue
     return out
@@ -82,7 +85,7 @@ def sanity_check(results: List[dict]) -> dict:
     for r in results:
         if not r["summaries"]:
             continue
-        stats = r["summaries"][0]["stats"]
+        stats = r["summaries"][0]
 
         if r["script"].startswith("1_"):
             st = stats

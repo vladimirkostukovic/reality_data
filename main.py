@@ -1,3 +1,4 @@
+from __future__ import annotations
 import json
 import sys
 import os
@@ -6,57 +7,95 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Any, Tuple, Optional, Set
+from typing import List, Dict, Any, Tuple, Optional
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 import smtplib
 from email.message import EmailMessage
-import re
-import ast
 import time
 
-# ------------ LOGGING  ------------
+# ============ CONFIGURATION ============
+AUDIT_SCHEMA = "gold"
+AUDIT_TABLE = "daily_job"
+
+# Fail-fast toggle: stop pipeline on first error
+FAIL_FAST = False
+
+# Layer toggles
+BRONZE_ENABLED = True
+SILVER_ENABLED = True
+GOLD_ENABLED = True
+BI_ENABLED = True
+
+# Bronze source toggles
+BEZREALITKY_ENABLED = True
+SREALITY_ENABLED = True
+IDNES_ENABLED = True
+
+# ============ LOGGING ============
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | main | %(message)s",
     handlers=[logging.StreamHandler(sys.stderr)],
     force=True,
 )
 log = logging.getLogger("main")
 
-# ------------ CONSTANTS ------------
+# ============ CONSTANTS ============
 TZ = ZoneInfo("Europe/Prague")
 PROJECT_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_ROOT / "config.json"
 
-BI_AUDIT_SCHEMA = "bi_reality_data"
-
-# ------------ INLINE TOGGLES ------------
-bezrealitky = True
-sreality    = True
-idnes       = True
-photo_modul = False
-silver      = True
-gold        = True
-bi          = True
-
-NON_CRITICAL: Set[str] = {
-    "photo_modul/wrapper_photo_modul.py",
-}
-
-STEPS: List[Tuple[str, bool]] = [
-    ("ETL/bezrealitky/wrapper_bezrealitky.py", bezrealitky),
-    ("ETL/sreality/wrapper_sreality.py",       sreality),
-    ("ETL/idnes/wrapper_idnes.py",             idnes),
-    ("photo_modul/wrapper_photo_modul.py",     photo_modul),
-    ("silver_layer/wrapper_silver.py",         silver),
-    ("gold/wrapper_gold.py",                   gold),
-    ("BI_reality_data/wrapper_bi.py",          bi),
+# ============ PIPELINE STEPS ============
+PIPELINE = [
+    # Bronze Layer
+    {
+        "layer": "bronze",
+        "source": "bezrealitky",
+        "enabled": BRONZE_ENABLED and BEZREALITKY_ENABLED,
+        "script": "ETL/bezrealitky/wrapper_bezrealitky.py",
+    },
+    {
+        "layer": "bronze",
+        "source": "sreality",
+        "enabled": BRONZE_ENABLED and SREALITY_ENABLED,
+        "script": "ETL/sreality/wrapper_sreality.py",
+    },
+    {
+        "layer": "bronze",
+        "source": "idnes",
+        "enabled": BRONZE_ENABLED and IDNES_ENABLED,
+        "script": "ETL/idnes/wrapper_idnes.py",
+    },
+    # Silver Layer
+    {
+        "layer": "silver",
+        "source": None,
+        "enabled": SILVER_ENABLED,
+        "script": "silver_layer/wrapper_silver.py",
+    },
+    # Gold Layer
+    {
+        "layer": "gold",
+        "source": None,
+        "enabled": GOLD_ENABLED,
+        "script": "gold/wrapper_gold.py",
+    },
+    # BI Layer
+    {
+        "layer": "bi",
+        "source": None,
+        "enabled": BI_ENABLED,
+        "script": "BI_reality_data/wrapper_bi.py",
+    },
 ]
 
-# ------------ CONFIG ------------
+
+# ============ CONFIG ============
 def load_cfg() -> dict:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
+
 
 def build_db_url(cfg: dict) -> str:
     u = cfg.get("USER") or cfg.get("user")
@@ -66,75 +105,64 @@ def build_db_url(cfg: dict) -> str:
     d = cfg.get("DB") or cfg.get("dbname")
     return f"postgresql+psycopg2://{u}:{p}@{h}:{port}/{d}"
 
-# ------------ DB INIT ------------
-DDL_JOB_RUNS = f"""
-CREATE TABLE IF NOT EXISTS {BI_AUDIT_SCHEMA}.job_runs (
+
+# ============ DB INIT ============
+DDL_DAILY_JOB = f"""
+CREATE TABLE IF NOT EXISTS {AUDIT_SCHEMA}.{AUDIT_TABLE} (
     id BIGSERIAL PRIMARY KEY,
     run_ts TIMESTAMPTZ NOT NULL,
+    layer TEXT NOT NULL,
+    source TEXT,
     step_name TEXT NOT NULL,
     status TEXT NOT NULL,
     elapsed_s NUMERIC,
-    rows_in BIGINT,
-    rows_out BIGINT,
-    inserted BIGINT,
-    updated BIGINT,
-    deleted BIGINT,
-    extra_json JSONB,
-    stderr_tail TEXT
+    rows_input BIGINT,
+    rows_output BIGINT,
+    rows_inserted BIGINT,
+    rows_updated BIGINT,
+    details JSONB,
+    error_message TEXT
 );
-CREATE INDEX IF NOT EXISTS job_runs_run_ts_idx
-    ON {BI_AUDIT_SCHEMA}.job_runs (run_ts DESC);
+CREATE INDEX IF NOT EXISTS {AUDIT_TABLE}_run_ts_idx ON {AUDIT_SCHEMA}.{AUDIT_TABLE} (run_ts DESC);
+CREATE INDEX IF NOT EXISTS {AUDIT_TABLE}_layer_idx ON {AUDIT_SCHEMA}.{AUDIT_TABLE} (layer);
 """
 
-def ensure_bi_tables(engine):
 
+def ensure_audit_table(engine):
     with engine.begin() as conn:
-        conn.execute(text(DDL_JOB_RUNS))
+        conn.execute(text(DDL_DAILY_JOB))
 
-# ------------ HELPERS ------------
-def _shortname(py_file: str) -> str:
-    p = Path(py_file)
-    name = p.stem.replace("wrapper_", "")
-    parent = p.parent.name
-    return name if parent == "ETL" or not parent else parent
 
-JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-def _parse_stats(stdout: str) -> Tuple[Dict[str, Any], bool]:
-    s = (stdout or "").strip()
-    if not s:
+# ============ JSON PARSING ============
+def parse_json_output(stdout: str) -> Tuple[Dict[str, Any], bool]:
+    if not stdout:
         return {}, False
     try:
-        obj = json.loads(s)
+        obj = json.loads(stdout.strip())
         if isinstance(obj, dict):
             return obj, True
     except Exception:
         pass
-
-    matches = list(JSON_OBJ_RE.finditer(s))
-    for m in reversed(matches):
-        block = m.group(0).strip()
-        for parser in (json.loads, ast.literal_eval):
-            try:
-                obj = parser(block)
-                if isinstance(obj, dict):
-                    return obj, True
-            except Exception:
-                continue
-
-    last = s.splitlines()[-1].strip()
-    for parser in (json.loads, ast.literal_eval):
+    lines = stdout.strip().splitlines()
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
         try:
-            obj = parser(last)
+            obj = json.loads(line)
             if isinstance(obj, dict):
                 return obj, True
         except Exception:
-            pass
+            continue
+
     return {}, False
 
-def run_wrapper(py_file: str) -> Tuple[bool, Dict[str, Any], str, float]:
-    cmd = [sys.executable, str(PROJECT_ROOT / py_file)]
+
+# ============ WRAPPER EXECUTION ============
+def run_wrapper(script_path: str) -> Tuple[bool, Dict[str, Any], str, float]:
+    cmd = [sys.executable, str(PROJECT_ROOT / script_path)]
     start = time.perf_counter()
+
     try:
         proc = subprocess.Popen(
             cmd,
@@ -144,104 +172,302 @@ def run_wrapper(py_file: str) -> Tuple[bool, Dict[str, Any], str, float]:
             stderr=subprocess.PIPE,
             text=True
         )
+        stdout_text, stderr_text = proc.communicate(timeout=7200)  # 2 hour timeout
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        elapsed = time.perf_counter() - start
+        return False, {"error": "timeout"}, "Process timeout after 2 hours", elapsed
     except Exception as e:
-        return False, {}, f"Exception on start: {e}", 0.0
+        elapsed = time.perf_counter() - start
+        return False, {"error": str(e)}, f"Exception: {e}", elapsed
 
-    stdout_text, stderr_text = proc.communicate()
-    dur = time.perf_counter() - start
+    elapsed = time.perf_counter() - start
 
-    stats, parsed = _parse_stats(stdout_text)
-    ok = False
+    json_data, parsed = parse_json_output(stdout_text)
+
+    success = False
     if parsed:
-        status = str(stats.get("status", "")).lower()
-        ok = (status == "ok") or (stats.get("success") is True) or (stats.get("ok") is True)
-    if not ok:
-        ok = (proc.returncode == 0)
+        status = str(json_data.get("status", "")).lower()
+        state = str(json_data.get("state", "")).lower()
+        ok = json_data.get("ok")
+
+        if status in ("success", "completed", "ok"):
+            success = True
+        elif state == "ok":
+            success = True
+        elif ok is True:
+            success = True
+        elif proc.returncode == 0:
+            success = True
+    else:
+        success = (proc.returncode == 0)
 
     stderr_tail = ""
     if stderr_text:
         lines = stderr_text.strip().splitlines()
-        stderr_tail = "\n".join(lines[-80:])[-20000:]
+        stderr_tail = "\n".join(lines[-50:])[-10000:]
 
-    return ok, (stats if parsed else {}), stderr_tail, dur
+    return success, json_data, stderr_tail, elapsed
 
-# ---- recursive numeric finder ----
-_NUM_LIKE = (int, float)
-def _first_num(d: Dict[str, Any], keys: List[str]) -> Optional[int]:
-    def visit(node: Any) -> Optional[int]:
-        if isinstance(node, dict):
-            for k in keys:
-                if k in node and isinstance(node[k], _NUM_LIKE) and not isinstance(node[k], bool):
-                    return int(node[k])
-            for v in node.values():
-                r = visit(v)
-                if r is not None:
-                    return r
-        elif isinstance(node, (list, tuple)):
-            for v in node:
-                r = visit(v)
-                if r is not None:
-                    return r
-        return None
-    return visit(d)
 
-def extract_before_after_total(stats: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    before_keys = ["before", "rows_before", "input_count", "start_count", "prev_rows", "prev_total"]
-    after_keys  = ["after", "rows_after", "output_count", "end_count", "curr_rows", "curr_total"]
-    total_keys  = [
-        "total_rows", "rows_total", "photo_rows_total", "price_rows_total",
-        "seller_rows_total", "gold_total", "total_typical", "total_standart", "total", "active_now"
-    ]
-    before = _first_num(stats, before_keys)
-    after  = _first_num(stats, after_keys)
-    total  = _first_num(stats, total_keys)
-    if total is None and after is not None:
-        total = after
-    return before, after, total
-
-# ------------ PERSIST ------------
-def persist_step(engine, run_ts, step, ok, stats, stderr_tail, elapsed_s):
-    def pick(d: Dict[str, Any], names: List[str]) -> Optional[int]:
-        for n in names:
-            v = d.get(n)
-            if isinstance(v, _NUM_LIKE) and not isinstance(v, bool):
-                return int(v)
-        return None
-    counts = {
-        "rows_in":  pick(stats or {}, ["rows_in", "input_count", "before", "rows_before"]),
-        "rows_out": pick(stats or {}, ["rows_out", "output_count", "after", "rows_after"]),
-        "inserted": pick(stats or {}, ["inserted", "added", "new_rows", "upserted", "processed", "inserted_new"]),
-        "updated":  pick(stats or {}, ["updated", "changed", "updated_changed"]),
-        "deleted":  pick(stats or {}, ["deleted", "removed", "archived_today", "archived_on_snapshot"]),
+# ============ DATA EXTRACTION ============
+def extract_metrics(layer: str, source: Optional[str], json_data: Dict[str, Any]) -> Dict[str, Any]:
+    metrics = {
+        "rows_input": None,
+        "rows_output": None,
+        "rows_inserted": None,
+        "rows_updated": None,
     }
-    extra = {k: v for k, v in (stats or {}).items() if k not in {"status", "success", "elapsed_s"}}
+
+    def find_number(data: Any, keys: List[str]) -> Optional[int]:
+        if isinstance(data, dict):
+            for key in keys:
+                if key in data:
+                    val = data[key]
+                    if isinstance(val, (int, float)) and not isinstance(val, bool):
+                        return int(val)
+            for v in data.values():
+                result = find_number(v, keys)
+                if result is not None:
+                    return result
+        elif isinstance(data, (list, tuple)):
+            for item in data:
+                result = find_number(item, keys)
+                if result is not None:
+                    return result
+        return None
+
+    if layer == "bronze":
+        results = json_data.get("results", [])
+        if results and isinstance(results, list):
+            first_result = results[0]
+            summaries = first_result.get("summaries", [])
+            if summaries and isinstance(summaries, list):
+                stats = summaries[0]
+
+                phase = stats.get("phase_counts", {})
+                metrics["rows_input"] = phase.get("source_rows") or stats.get("source_rows")
+
+                metrics["rows_output"] = stats.get("total_rows")
+
+                metrics["rows_inserted"] = (
+                        phase.get("added") or
+                        stats.get("new_rows") or
+                        stats.get("inserted_new") or
+                        stats.get("added_today")
+                )
+
+    # Silver layer
+    elif layer == "silver":
+        agg = json_data.get("aggregated", {})
+        metrics["rows_input"] = agg.get("rows_input")
+        metrics["rows_output"] = agg.get("rows_output")
+        metrics["rows_inserted"] = agg.get("rows_inserted")
+        metrics["rows_updated"] = agg.get("rows_updated")
+
+    # Gold layer
+    elif layer == "gold":
+        agg = json_data.get("aggregated", {})
+        metrics["rows_input"] = agg.get("rows_fetched")
+        metrics["rows_output"] = agg.get("rows_filtered") or agg.get("rows_matched")
+        metrics["rows_inserted"] = agg.get("rows_inserted")
+        metrics["rows_updated"] = agg.get("rows_updated")
+
+    # BI layer
+    elif layer == "bi":
+        agg = json_data.get("aggregated", {})
+        metrics["rows_input"] = find_number(agg, [
+            "rows_fetched",
+            "sanity_gold_totalized_distinct_objects"
+        ])
+        metrics["rows_output"] = (
+                agg.get("rows_created") or
+                find_number(agg, ["rows_dim_date", "rows_fact_active"])
+        )
+        metrics["rows_inserted"] = metrics["rows_output"]
+
+    return metrics
+
+
+# ============ PERSIST TO DB ============
+def persist_step(engine, run_ts: datetime, step: Dict[str, Any], success: bool,
+                 json_data: Dict[str, Any], stderr: str, elapsed_s: float):
+    metrics = extract_metrics(step["layer"], step.get("source"), json_data)
+
+    error_msg = None
+    if not success:
+        error_msg = json_data.get("error") or stderr[:500] if stderr else "Unknown error"
+
     with engine.begin() as conn:
         conn.execute(text(f"""
-            INSERT INTO {BI_AUDIT_SCHEMA}.job_runs
-            (run_ts, step_name, status, elapsed_s, rows_in, rows_out,
-             inserted, updated, deleted, extra_json, stderr_tail)
+            INSERT INTO {AUDIT_SCHEMA}.{AUDIT_TABLE}
+            (run_ts, layer, source, step_name, status, elapsed_s,
+             rows_input, rows_output, rows_inserted, rows_updated,
+             details, error_message)
             VALUES
-            (:run_ts, :step, :status, :elapsed_s, :rows_in, :rows_out,
-             :inserted, :updated, :deleted, :extra_json, :stderr_tail)
-        """), dict(
-            run_ts=run_ts,
-            step=step,
-            status="ok" if ok else "fail",
-            elapsed_s=elapsed_s,
-            rows_in=counts["rows_in"],
-            rows_out=counts["rows_out"],
-            inserted=counts["inserted"],
-            updated=counts["updated"],
-            deleted=counts["deleted"],
-            extra_json=json.dumps(extra, ensure_ascii=False) if extra else None,
-            stderr_tail=stderr_tail or None,
-        ))
+            (:run_ts, :layer, :source, :step_name, :status, :elapsed_s,
+             :rows_input, :rows_output, :rows_inserted, :rows_updated,
+             :details, :error_message)
+        """), {
+            "run_ts": run_ts,
+            "layer": step["layer"],
+            "source": step.get("source"),
+            "step_name": Path(step["script"]).stem,
+            "status": "ok" if success else "fail",
+            "elapsed_s": round(elapsed_s, 3),
+            "rows_input": metrics["rows_input"],
+            "rows_output": metrics["rows_output"],
+            "rows_inserted": metrics["rows_inserted"],
+            "rows_updated": metrics["rows_updated"],
+            "details": json.dumps(json_data, ensure_ascii=False) if json_data else None,
+            "error_message": error_msg,
+        })
 
-# ------------ EMAIL  ------------
-def send_email(cfg, subject, body):
+
+# ============ REPORT GENERATION ============
+def format_number(n: Optional[int]) -> str:
+    return f"{n:,}" if n is not None else "-"
+
+
+def generate_report(run_ts: datetime, results: List[Dict[str, Any]], total_elapsed: float) -> str:
+    lines = []
+    lines.append("=" * 80)
+    lines.append(f"Reality Pipeline Report — {run_ts.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    lines.append("=" * 80)
+    lines.append("")
+
+    layers = {}
+    for r in results:
+        layer = r["layer"]
+        if layer not in layers:
+            layers[layer] = []
+        layers[layer].append(r)
+
+    # Bronze Layer
+    if "bronze" in layers:
+        lines.append("BRONZE LAYER:")
+        lines.append(
+            "┌" + "─" * 14 + "┬" + "─" * 8 + "┬" + "─" * 10 + "┬" + "─" * 10 + "┬" + "─" * 10 + "┬" + "─" * 9 + "┐")
+        lines.append("│ Source       │ Status │ Input    │ Output   │ Inserted │ Time(s) │")
+        lines.append(
+            "├" + "─" * 14 + "┼" + "─" * 8 + "┼" + "─" * 10 + "┼" + "─" * 10 + "┼" + "─" * 10 + "┼" + "─" * 9 + "┤")
+
+        for r in layers["bronze"]:
+            src = (r["source"] or "unknown")[:12].ljust(12)
+            status = r["status"][:6].ljust(6)
+            inp = format_number(r["metrics"]["rows_input"]).rjust(8)
+            out = format_number(r["metrics"]["rows_output"]).rjust(8)
+            ins = format_number(r["metrics"]["rows_inserted"]).rjust(8)
+            elapsed = f"{r['elapsed_s']:.1f}".rjust(7)
+            lines.append(f"│ {src} │ {status} │ {inp} │ {out} │ {ins} │ {elapsed} │")
+
+        lines.append(
+            "└" + "─" * 14 + "┴" + "─" * 8 + "┴" + "─" * 10 + "┴" + "─" * 10 + "┴" + "─" * 10 + "┴" + "─" * 9 + "┘")
+        lines.append("")
+
+    # Silver Layer - ДЕТАЛЬНАЯ ТАБЛИЦА
+    if "silver" in layers:
+        lines.append("SILVER LAYER:")
+        r = layers["silver"][0]
+
+        silver_steps = r.get("silver_steps", [])
+
+        if silver_steps:
+            # Детальная таблица по шагам
+            lines.append("┌" + "─" * 22 + "┬" + "─" * 8 + "┬" + "─" * 10 + "┬" + "─" * 10 + "┬" + "─" * 9 + "┐")
+            lines.append("│ Step                 │ Status │ Input    │ Output   │ Time(s) │")
+            lines.append("├" + "─" * 22 + "┼" + "─" * 8 + "┼" + "─" * 10 + "┼" + "─" * 10 + "┼" + "─" * 9 + "┤")
+
+            for step in silver_steps:
+                step_name = step["step"][:20].ljust(20)
+                status = step["status"][:6].ljust(6)
+                inp = format_number(step.get("rows_input")).rjust(8)
+                out = format_number(step.get("rows_output")).rjust(8)
+                elapsed = f"{step['elapsed_s']:.1f}".rjust(7)
+                lines.append(f"│ {step_name} │ {status} │ {inp} │ {out} │ {elapsed} │")
+
+            lines.append("└" + "─" * 22 + "┴" + "─" * 8 + "┴" + "─" * 10 + "┴" + "─" * 10 + "┴" + "─" * 9 + "┘")
+        else:
+            status = r["status"][:6].ljust(6)
+            inp = format_number(r["metrics"]["rows_input"]).rjust(8)
+            out = format_number(r["metrics"]["rows_output"]).rjust(8)
+            elapsed = f"{r['elapsed_s']:.1f}".rjust(7)
+
+            lines.append("┌" + "─" * 21 + "┬" + "─" * 8 + "┬" + "─" * 10 + "┬" + "─" * 10 + "┬" + "─" * 9 + "┐")
+            lines.append("│ Step                │ Status │ Input    │ Output   │ Time(s) │")
+            lines.append("├" + "─" * 21 + "┼" + "─" * 8 + "┼" + "─" * 10 + "┼" + "─" * 10 + "┼" + "─" * 9 + "┤")
+            lines.append(f"│ silver_pipeline     │ {status} │ {inp} │ {out} │ {elapsed} │")
+            lines.append("└" + "─" * 21 + "┴" + "─" * 8 + "┴" + "─" * 10 + "┴" + "─" * 10 + "┴" + "─" * 9 + "┘")
+
+        lines.append("")
+
+    # Gold Layer
+    if "gold" in layers:
+        lines.append("GOLD LAYER:")
+        r = layers["gold"][0]
+        status = r["status"][:6].ljust(6)
+        inp = format_number(r["metrics"]["rows_input"]).rjust(8)
+        out = format_number(r["metrics"]["rows_output"]).rjust(8)
+        ins = format_number(r["metrics"]["rows_inserted"]).rjust(8)
+        elapsed = f"{r['elapsed_s']:.1f}".rjust(7)
+
+        lines.append(
+            "┌" + "─" * 17 + "┬" + "─" * 8 + "┬" + "─" * 10 + "┬" + "─" * 10 + "┬" + "─" * 10 + "┬" + "─" * 9 + "┐")
+        lines.append("│ Step            │ Status │ Fetched  │ Matched  │ Inserted │ Time(s) │")
+        lines.append(
+            "├" + "─" * 17 + "┼" + "─" * 8 + "┼" + "─" * 10 + "┼" + "─" * 10 + "┼" + "─" * 10 + "┼" + "─" * 9 + "┤")
+        lines.append(f"│ gold_pipeline   │ {status} │ {inp} │ {out} │ {ins} │ {elapsed} │")
+        lines.append(
+            "└" + "─" * 17 + "┴" + "─" * 8 + "┴" + "─" * 10 + "┴" + "─" * 10 + "┴" + "─" * 10 + "┴" + "─" * 9 + "┘")
+        lines.append("")
+
+    # BI Layer
+    if "bi" in layers:
+        lines.append("BI LAYER:")
+        r = layers["bi"][0]
+        status = r["status"][:6].ljust(6)
+        inp = format_number(r["metrics"]["rows_input"]).rjust(8)
+        out = format_number(r["metrics"]["rows_output"]).rjust(8)
+        elapsed = f"{r['elapsed_s']:.1f}".rjust(7)
+
+        lines.append("┌" + "─" * 14 + "┬" + "─" * 8 + "┬" + "─" * 10 + "┬" + "─" * 10 + "┬" + "─" * 9 + "┐")
+        lines.append("│ Step         │ Status │ Input    │ Created  │ Time(s) │")
+        lines.append("├" + "─" * 14 + "┼" + "─" * 8 + "┼" + "─" * 10 + "┼" + "─" * 10 + "┼" + "─" * 9 + "┤")
+        lines.append(f"│ bi_pipeline  │ {status} │ {inp} │ {out} │ {elapsed} │")
+        lines.append("└" + "─" * 14 + "┴" + "─" * 8 + "┴" + "─" * 10 + "┴" + "─" * 10 + "┴" + "─" * 9 + "┘")
+        lines.append("")
+
+    # Summary
+    lines.append("=" * 80)
+    overall_ok = all(r["status"] == "ok" for r in results if r["status"] != "skip")
+    lines.append(f"Overall: {'SUCCESS ✓' if overall_ok else 'FAILED ✗'}")
+
+    minutes = int(total_elapsed // 60)
+    seconds = int(total_elapsed % 60)
+    lines.append(f"Total elapsed: {total_elapsed:.1f}s ({minutes}m {seconds}s)")
+    lines.append("=" * 80)
+
+    # Errors
+    errors = [r for r in results if r["status"] == "fail"]
+    if errors:
+        lines.append("")
+        lines.append("ERRORS:")
+        for err in errors:
+            lines.append(
+                f"  - {err['layer']}/{err.get('source') or err['step_name']}: {err.get('error_message', 'Unknown error')[:200]}")
+    else:
+        lines.append("")
+        lines.append("Errors: None")
+
+    return "\n".join(lines)
+
+
+# ============ EMAIL ============
+def send_email(cfg: dict, subject: str, body: str):
     host = cfg.get("SMTP_HOST")
     if not host:
         return
+
     port = int(cfg.get("SMTP_PORT", 587))
     msg = EmailMessage()
     msg["From"] = cfg.get("SMTP_FROM", cfg.get("SMTP_USER", "pipeline@localhost"))
@@ -256,93 +482,143 @@ def send_email(cfg, subject, body):
             if cfg.get("SMTP_USER") and cfg.get("SMTP_PASS"):
                 s.login(cfg["SMTP_USER"], cfg["SMTP_PASS"])
             s.send_message(msg)
-    except Exception:
-        pass
+        log.info("Email sent successfully")
+    except Exception as e:
+        log.error(f"Failed to send email: {e}")
 
-# ------------ MAIN ------------
+
+# ============ MAIN ============
 def main():
     cfg = load_cfg()
     engine = create_engine(build_db_url(cfg), pool_pre_ping=True, future=True)
 
-    ensure_bi_tables(engine)
+    # Ensure audit table exists
+    ensure_audit_table(engine)
 
     run_ts = datetime.now(tz=TZ)
-    summaries: List[Dict[str, Any]] = []
+    results = []
     overall_ok = True
-    hard_stopped = False
+    start_time = time.perf_counter()
 
-    for i, (path, enabled) in enumerate(STEPS):
-        name = _shortname(path)
-        if not enabled:
-            summaries.append({"name": name, "status": "skip", "before": None, "after": None, "total": None})
+    log.info("=" * 80)
+    log.info(f"Starting Reality Pipeline — {run_ts.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    log.info("=" * 80)
+
+    # Run pipeline
+    for step in PIPELINE:
+        if not step["enabled"]:
+            results.append({
+                "layer": step["layer"],
+                "source": step.get("source"),
+                "step_name": Path(step["script"]).stem,
+                "status": "skip",
+                "elapsed_s": 0.0,
+                "metrics": {
+                    "rows_input": None,
+                    "rows_output": None,
+                    "rows_inserted": None,
+                    "rows_updated": None,
+                },
+                "error_message": None,
+            })
             continue
 
-        script_path = PROJECT_ROOT / path
-        if not script_path.exists():
-            ok, stats, stderr, elapsed = False, {}, f"File not found: {path}", 0.0
-        else:
-            ok, stats, stderr, elapsed = run_wrapper(path)
+        step_name = f"{step['layer']}/{step.get('source') or Path(step['script']).stem}"
+        log.info(f"Running: {step_name}")
 
-        try:
-            persist_step(engine, run_ts, path, ok, stats, stderr, elapsed)
-        except Exception:
-            pass
+        success, json_data, stderr, elapsed = run_wrapper(step["script"])
+        metrics = extract_metrics(step["layer"], step.get("source"), json_data)
 
-        before, after, total = extract_before_after_total(stats or {})
-        summaries.append({
-            "name": name,
-            "status": "ok" if ok else "fail",
-            "before": before,
-            "after": after,
-            "total": total
-        })
-
-        if not ok and (path not in NON_CRITICAL):
+        error_msg = None
+        if not success:
+            error_msg = json_data.get("error") or (stderr[:500] if stderr else "Unknown error")
+            log.error(f"FAILED: {step_name} — {error_msg}")
             overall_ok = False
-            hard_stopped = True
-            for rest_path, rest_enabled in STEPS[i+1:]:
-                if rest_enabled:
-                    summaries.append({
-                        "name": _shortname(rest_path),
+        else:
+            log.info(f"OK: {step_name} ({elapsed:.1f}s)")
+
+        result_entry = {
+            "layer": step["layer"],
+            "source": step.get("source"),
+            "step_name": Path(step["script"]).stem,
+            "status": "ok" if success else "fail",
+            "elapsed_s": elapsed,
+            "metrics": metrics,
+            "error_message": error_msg,
+        }
+
+        if step["layer"] == "silver" and "steps" in json_data:
+            result_entry["silver_steps"] = json_data["steps"]
+
+        results.append(result_entry)
+
+        # Persist to DB
+        try:
+            persist_step(engine, run_ts, step, success, json_data, stderr, elapsed)
+        except Exception as e:
+            log.error(f"Failed to persist step result: {e}")
+
+        # Fail-fast check
+        if FAIL_FAST and not success:
+            log.error("FAIL_FAST enabled, stopping pipeline")
+            # Mark remaining steps as skipped
+            idx = PIPELINE.index(step)
+            for remaining in PIPELINE[idx + 1:]:
+                if remaining["enabled"]:
+                    results.append({
+                        "layer": remaining["layer"],
+                        "source": remaining.get("source"),
+                        "step_name": Path(remaining["script"]).stem,
                         "status": "skip",
-                        "before": None,
-                        "after": None,
-                        "total": None
+                        "elapsed_s": 0.0,
+                        "metrics": {
+                            "rows_input": None,
+                            "rows_output": None,
+                            "rows_inserted": None,
+                            "rows_updated": None,
+                        },
+                        "error_message": "Skipped due to previous failure",
                     })
             break
 
-    # ======== Short log ========
-    lines = []
-    lines.append(f"Reality Pipeline — {run_ts.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    for s in summaries:
-        b = "-" if s["before"] is None else f"{s['before']}"
-        a = "-" if s["after"]  is None else f"{s['after']}"
-        t = "-" if s["total"]  is None else f"{s['total']}"
-        lines.append(f"{s['name']}: status={s['status']} | before={b} | after={a} | total={t}")
-    lines.append(f"Overall: {'ok' if overall_ok else 'fail'}")
-    if hard_stopped:
-        lines.append("Stopped: first critical failure triggered early exit")
+    total_elapsed = time.perf_counter() - start_time
 
-    text_block = "\n".join(lines)
-    sys.stderr.write("\n" + text_block + "\n")
+    # Generate report
+    report = generate_report(run_ts, results, total_elapsed)
 
+    # Output to console
+    print("\n" + report)
+
+    # Save to log file
     log_dir = PROJECT_ROOT / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     ts = run_ts.strftime("%Y%m%d_%H%M")
-    (log_dir / f"bi_run_{ts}.log").write_text(text_block, encoding="utf-8")
-    (log_dir / "last_run.log").write_text(text_block, encoding="utf-8")
+    (log_dir / f"pipeline_{ts}.log").write_text(report, encoding="utf-8")
+    (log_dir / "last_run.log").write_text(report, encoding="utf-8")
 
-    subject = f"[Reality Pipeline] {('OK' if overall_ok else 'FAIL')} — {run_ts.strftime('%Y-%m-%d %H:%M')}"
-    send_email(cfg, subject, text_block)
+    # Send email
+    subject = f"[Reality Pipeline] {'SUCCESS' if overall_ok else 'FAILED'} — {run_ts.strftime('%Y-%m-%d %H:%M')}"
+    send_email(cfg, subject, report)
 
+    # JSON output
     print(json.dumps({
         "run_ts": run_ts.isoformat(),
         "overall_ok": overall_ok,
-        "stopped_early": hard_stopped,
-        "summary": summaries
+        "total_elapsed_s": round(total_elapsed, 3),
+        "fail_fast_enabled": FAIL_FAST,
+        "results": results
     }, ensure_ascii=False))
 
     sys.exit(0 if overall_ok else 1)
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log.exception(f"Fatal error: {e}")
+        print(json.dumps({
+            "error": str(e),
+            "overall_ok": False
+        }, ensure_ascii=False))
+        sys.exit(1)

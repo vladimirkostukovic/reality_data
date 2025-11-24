@@ -1,12 +1,15 @@
+from __future__ import annotations
 import subprocess
 import sys
 import json
 import time
+import shlex
 import logging
 from pathlib import Path
-from sqlalchemy import create_engine, text
+from typing import Dict, Any, List
+from datetime import datetime
 
-# ---------- LOGGING (stderr only) ----------
+# ---------- LOGGING ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | wrapper_bi | %(message)s",
@@ -16,138 +19,154 @@ logging.basicConfig(
 log = logging.getLogger("wrapper_bi")
 
 # ---------- CONFIG ----------
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-cfg = json.loads((PROJECT_ROOT / "config.json").read_text(encoding="utf-8"))
+SCRIPT_DIR = Path(__file__).resolve().parent
 
-db_user = cfg.get("user") or cfg.get("USER")
-db_pwd  = cfg.get("password") or cfg.get("PWD")
-db_host = cfg.get("host") or cfg.get("HOST")
-db_port = cfg.get("port") or cfg.get("PORT")
-db_name = cfg.get("dbname") or cfg.get("DB")
-DB_URL  = f"postgresql+psycopg2://{db_user}:{db_pwd}@{db_host}:{db_port}/{db_name}"
+# Scripts to run in order
+SCRIPTS = ["gold_to_bi.py", "flat_table.py"]
 
-engine = create_engine(DB_URL, pool_pre_ping=True, connect_args={"connect_timeout": 10})
-BI_SCHEMA = "bi_reality_data"
+# Per-step timeout (seconds)
+STEP_TIMEOUT = 3600  # 1 hour
 
-GOLD_SCRIPT = PROJECT_ROOT / "BI_reality_data" / "gold_to_bi.py"
-FLAT_SCRIPT = PROJECT_ROOT / "BI_reality_data" / "flat_table.py"
 
-# ---------- FUNCTIONS ----------
-def ensure_stats_table(conn):
-    conn.execute(text(f"""
-        CREATE TABLE IF NOT EXISTS {BI_SCHEMA}.pipeline_stats (
-            id              BIGSERIAL PRIMARY KEY,
-            run_at          TIMESTAMPTZ DEFAULT now(),
-            step            TEXT,
-            ok              BOOLEAN,
-            rc              INT,
-            elapsed_s       NUMERIC,
-            rows_dim_date   INT,
-            rows_dim_geo    INT,
-            rows_dim_seller INT,
-            rows_dim_object INT,
-            rows_fact_object_periods INT,
-            rows_price_events INT,
-            notes            JSONB
-        );
-    """))
+# ---------- UTILS ----------
+def run_script(py_file: str) -> Dict[str, Any]:
+    """Run a Python script and parse the last JSON line from stdout."""
+    step_name = Path(py_file).stem
+    script_path = SCRIPT_DIR / py_file
 
-def run_script(script_path: Path, step_name: str) -> dict:
-    cmd = [sys.executable, str(script_path)]
-    log.info(f"Launch {step_name}: {' '.join(cmd)}")
-    t0 = time.perf_counter()
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=3600
-    )
-    elapsed = round(time.perf_counter() - t0, 2)
-
-    if proc.returncode != 0:
-        log.error(f"{step_name} exited with code {proc.returncode}")
-        log.error(proc.stderr.strip())
+    if not script_path.exists():
+        log.error(f"{py_file}: file not found at {script_path}")
         return {
             "step": step_name,
-            "ok": False,
-            "rc": proc.returncode,
-            "error": proc.stderr.strip(),
-            "elapsed_s": elapsed
+            "status": "error",
+            "error": "file_not_found",
+            "elapsed_s": 0.0
         }
+
+    cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(script_path))}"
+    log.info(f"Starting {py_file}...")
+    t0 = time.perf_counter()
+
+    proc = subprocess.Popen(
+        shlex.split(cmd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(SCRIPT_DIR),
+    )
 
     try:
-        out = json.loads(proc.stdout.strip() or "{}")
-        out["elapsed_s"] = out.get("elapsed_s", elapsed)
-        out["step"] = step_name
-        out["ok"] = out.get("ok", True)
-        out["rc"] = proc.returncode
-        return out
-    except Exception as e:
-        log.error(f"Failed to parse JSON from stdout ({step_name}): {e}")
-        log.error(proc.stdout)
+        out, err = proc.communicate(timeout=STEP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log.error(f"{py_file}: timeout after {STEP_TIMEOUT}s")
+        proc.kill()
+        try:
+            out, err = proc.communicate(timeout=5)
+        except Exception:
+            out, err = "", ""
+        elapsed = time.perf_counter() - t0
         return {
             "step": step_name,
-            "ok": False,
-            "rc": 99,
-            "error": f"JSON parse failed: {e}",
-            "elapsed_s": elapsed
+            "status": "error",
+            "error": "timeout",
+            "elapsed_s": round(elapsed, 3)
         }
 
-def insert_stats(conn, result: dict):
-    stats = result.get("stats", {}) or {}
-    conn.execute(text(f"""
-        INSERT INTO {BI_SCHEMA}.pipeline_stats (
-            step, ok, rc, elapsed_s,
-            rows_dim_date, rows_dim_geo, rows_dim_seller, rows_dim_object,
-            rows_fact_object_periods, rows_price_events, notes
-        )
-        VALUES (
-            :step, :ok, :rc, :elapsed_s,
-            :rows_dim_date, :rows_dim_geo, :rows_dim_seller, :rows_dim_object,
-            :rows_fact_object_periods, :rows_price_events, :notes
-        )
-    """), {
-        "step": result.get("step"),
-        "ok": result.get("ok"),
-        "rc": result.get("rc", 1),
-        "elapsed_s": result.get("elapsed_s"),
-        "rows_dim_date": stats.get("rows_dim_date"),
-        "rows_dim_geo": stats.get("rows_dim_geo"),
-        "rows_dim_seller": stats.get("rows_dim_seller"),
-        "rows_dim_object": stats.get("rows_dim_object"),
-        "rows_fact_object_periods": stats.get("rows_fact_object_periods"),
-        "rows_price_events": stats.get("rows_price_events"),
-        "notes": json.dumps(stats or result)
-    })
+    elapsed = time.perf_counter() - t0
+    rc = proc.returncode
 
-# ---------- MAIN ----------
-def main():
-    t0 = time.perf_counter()
-    steps = [
-        ("gold_to_bi", GOLD_SCRIPT),
-        ("flat_table", FLAT_SCRIPT),
-    ]
-    all_ok = True
+    # Log stderr
+    if err:
+        for line in err.splitlines():
+            if line.strip():
+                log.info(f"[{py_file}] {line}")
 
-    with engine.begin() as conn:
-        ensure_stats_table(conn)
-
-        for step_name, script in steps:
-            result = run_script(script, step_name)
-            insert_stats(conn, result)
-            if not result.get("ok"):
-                all_ok = False
-                log.error(f"Step {step_name} failed; stopping pipeline.")
+    # Parse last JSON line from stdout
+    parsed = None
+    if out:
+        for line in reversed(out.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
                 break
+            except Exception:
+                continue
 
-    elapsed = round(time.perf_counter() - t0, 3)
-    log.info(f"BI pipeline finished in {elapsed}s (ok={all_ok})")
+    if parsed is None:
+        log.error(f"{py_file}: no valid JSON in stdout")
+        return {
+            "step": step_name,
+            "status": "error",
+            "error": "no_json_output",
+            "rc": rc,
+            "elapsed_s": round(elapsed, 3)
+        }
 
-    print(json.dumps({
-        "step": "wrapper_bi",
-        "ok": all_ok,
-        "elapsed_s": elapsed
-    }, ensure_ascii=False))
+    # Add metadata
+    parsed["step"] = step_name
+    parsed["elapsed_s"] = round(elapsed, 3)
+    parsed["rc"] = rc
+
+    log.info(f"Finished {py_file}: status={parsed.get('status')} rc={rc} elapsed={elapsed:.2f}s")
+    return parsed
+
+
+def aggregate_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate numeric fields from all steps."""
+    agg = {}
+    skip_keys = {"step", "status", "error", "elapsed_s", "rc", "timestamp", "stats"}
+
+    for result in results:
+        # Aggregate top-level numeric fields
+        for key, value in result.items():
+            if key in skip_keys:
+                continue
+            if isinstance(value, (int, float)):
+                agg[key] = agg.get(key, 0) + value
+
+        # Also aggregate from nested 'stats' dict
+        if "stats" in result and isinstance(result["stats"], dict):
+            for key, value in result["stats"].items():
+                if isinstance(value, (int, float)):
+                    agg[key] = agg.get(key, 0) + value
+
+    return agg
+
+
+def main():
+    start_time = time.perf_counter()
+    results = []
+
+    # Run all scripts regardless of failures
+    for script in SCRIPTS:
+        result = run_script(script)
+        results.append(result)
+
+    total_elapsed = time.perf_counter() - start_time
+    aggregated = aggregate_results(results)
+
+    summary = {
+        "status": "completed",
+        "total_elapsed_s": round(total_elapsed, 3),
+        "steps_run": len(results),
+        "timestamp": datetime.now().isoformat(),
+        "aggregated": aggregated,
+        "details": results
+    }
+
+    # Output final JSON
+    print(json.dumps(summary, ensure_ascii=False))
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log.exception(f"Wrapper fatal error: {e}")
+        print(json.dumps({
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }, ensure_ascii=False))
