@@ -1,3 +1,6 @@
+# Loads silver.price_change, maps it to summarized_geo to resolve internal_id,
+# enforces append-only gold.price_change table with DDL and trigger guards,
+# inserts only new (internal_id, change_date, new_price) records and emits strict JSON sync_summary.
 
 from __future__ import annotations
 
@@ -18,21 +21,21 @@ CFG = json.loads((PROJECT_ROOT / "config.json").read_text(encoding="utf-8"))
 DB_URL = f"postgresql+psycopg2://{CFG['USER']}:{CFG['PWD']}@{CFG['HOST']}:{CFG['PORT']}/{CFG['DB']}"
 
 SCHEMA_SILVER = "silver"
-SCHEMA_GOLD   = "gold"
+SCHEMA_GOLD = "gold"
 
-SRC_TABLE      = "price_change"     # silver.price_change
-SUMM_TABLE     = "summarized_geo"   # silver.summarized_geo
-TGT_TABLE      = "price_change"     # gold.price_change
+SRC_TABLE = "price_change"
+SUMM_TABLE = "summarized_geo"
+TGT_TABLE = "price_change"
 
-
-SRC_ID_COL     = "id"        # в silver.price_change это varchar(64)
-SRC_SRCID_COL  = "source_id"
-SUMM_SITE_COL  = "site_id"   # в silver.summarized_geo
+SRC_ID_COL = "id"
+SRC_SRCID_COL = "source_id"
+SUMM_SITE_COL = "site_id"
 SUMM_SRCID_COL = "source_id"
-SUMM_IID_COL   = "internal_id"
-SUMM_TS_COL    = "ingested_at"
+SUMM_IID_COL = "internal_id"
+SUMM_TS_COL = "ingested_at"
 
-# ============== JSON helper ==============
+
+# ============== JSON helpers ==============
 def _json_default(o):
     if isinstance(o, (datetime, pd.Timestamp)): return o.isoformat()
     if isinstance(o, date): return o.isoformat()
@@ -42,24 +45,23 @@ def _json_default(o):
     if isinstance(o, Decimal): return float(o)
     return str(o)
 
-def _emit(stage: str, **payload):
-    print(json.dumps({"stage": stage, **payload}, ensure_ascii=False, default=_json_default), flush=True)
 
 def _pg_diag_payload(exc: Exception):
     d = {"type": type(exc).__name__}
     orig = getattr(exc, "orig", None)
     if orig is not None:
-        d["pgcode"]  = getattr(orig, "pgcode", None)
+        d["pgcode"] = getattr(orig, "pgcode", None)
         d["pgerror"] = getattr(orig, "pgerror", None)
         diag = getattr(orig, "diag", None)
         if diag:
-            for k in ("schema_name","table_name","column_name","datatype_name",
-                      "constraint_name","message_primary","message_detail","context"):
+            for k in ("schema_name", "table_name", "column_name", "datatype_name",
+                      "constraint_name", "message_primary", "message_detail", "context"):
                 v = getattr(diag, k, None)
                 if v: d[k] = str(v)
     stmt = getattr(exc, "statement", None)
     if stmt: d["statement_preview"] = stmt[:300]
     return d
+
 
 # ============== DDL ==============
 DDL_TABLE = f"""
@@ -79,9 +81,7 @@ CREATE INDEX IF NOT EXISTS idx_{TGT_TABLE}_internal_id ON {SCHEMA_GOLD}.{TGT_TAB
 CREATE INDEX IF NOT EXISTS idx_{TGT_TABLE}_change_date ON {SCHEMA_GOLD}.{TGT_TABLE} (change_date);
 """
 
-
 DDL_ENSURE_APPEND_ONLY = f"""
--- НЕ дропаем функцию: безопасно обновляем определение
 CREATE OR REPLACE FUNCTION {SCHEMA_GOLD}.prevent_mutations_{TGT_TABLE}() RETURNS trigger AS $$
 BEGIN
   IF TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN
@@ -96,8 +96,7 @@ DECLARE
   v_relid oid;
   v_trg_exists boolean;
 BEGIN
-  SELECT c.oid
-    INTO v_relid
+  SELECT c.oid INTO v_relid
   FROM pg_class c
   JOIN pg_namespace n ON n.oid = c.relnamespace
   WHERE n.nspname = '{SCHEMA_GOLD}'
@@ -129,7 +128,6 @@ FROM {SCHEMA_SILVER}.{SRC_TABLE}
 WHERE {SRC_ID_COL} IS NOT NULL;
 """
 
-
 MAP_CTE = f"""
 WITH map AS (
   SELECT DISTINCT ON (s.{SUMM_SRCID_COL}, s.{SUMM_SITE_COL})
@@ -146,7 +144,7 @@ SQL_COUNT_MATCH = MAP_CTE + f"""
 SELECT COUNT(*)::bigint
 FROM {SCHEMA_SILVER}.{SRC_TABLE} pc
 JOIN map m
-  ON m.source_id    = pc.{SRC_SRCID_COL}
+  ON m.source_id = pc.{SRC_SRCID_COL}
  AND m.site_id_text = pc.{SRC_ID_COL}::text
 WHERE pc.{SRC_ID_COL} IS NOT NULL;
 """
@@ -163,63 +161,58 @@ SELECT
   pc.ingested_at
 FROM {SCHEMA_SILVER}.{SRC_TABLE} pc
 JOIN map m
-  ON m.source_id    = pc.{SRC_SRCID_COL}
+  ON m.source_id = pc.{SRC_SRCID_COL}
  AND m.site_id_text = pc.{SRC_ID_COL}::text
 WHERE pc.{SRC_ID_COL} IS NOT NULL
   AND pc.new_price IS NOT NULL
   AND pc.change_date IS NOT NULL
-ON CONFLICT (internal_id, change_date, new_price) DO NOTHING;
+ON CONFLICT DO NOTHING;
 """
 
+
+# ============== MAIN ==============
 def main():
+    result = {
+        "status": "success",
+        "source_rows": 0,
+        "rows_matched": 0,
+        "rows_inserted": 0,
+        "timestamp": datetime.now().isoformat()
+    }
+
     engine = create_engine(DB_URL, pool_pre_ping=True)
 
-    # DDL: таблица + индексы
     try:
+        # DDL operations
         with engine.begin() as conn:
             conn.execute(text(DDL_TABLE))
-        _emit("ddl_table_ok", ok=True, target=f"{SCHEMA_GOLD}.{TGT_TABLE}")
-    except SQLAlchemyError as e:
-        _emit("error", ok=False, where="ddl_table", diag=_pg_diag_payload(e))
-        sys.exit(1)
-
-    # DDL: append-only
-    try:
-        with engine.begin() as conn:
             conn.execute(text(DDL_ENSURE_APPEND_ONLY))
-        _emit("ddl_append_only_ok", ok=True)
-    except SQLAlchemyError as e:
-        _emit("error", ok=False, where="ddl_append_only", diag=_pg_diag_payload(e))
-        sys.exit(1)
 
-    try:
+        # Get stats and insert
         with engine.begin() as conn:
             total_src = conn.execute(text(SQL_COUNT_SRC)).scalar_one()
             total_match = conn.execute(text(SQL_COUNT_MATCH)).scalar_one()
-        _emit("pre_insert_stats", ok=True, source_rows=int(total_src), matched_by_mapping=int(total_match))
-    except SQLAlchemyError as e:
-        _emit("error", ok=False, where="count_stats", diag=_pg_diag_payload(e))
-        sys.exit(1)
 
+            result["source_rows"] = int(total_src)
+            result["rows_matched"] = int(total_match)
 
-    try:
-        with engine.begin() as conn:
             res = conn.execute(text(SQL_INSERT))
-            # rowcount у INSERT ... ON CONFLICT DO NOTHING может быть None, поэтому аккуратно
             inserted = 0 if res.rowcount in (None, -1) else int(res.rowcount)
+            result["rows_inserted"] = inserted
+
     except SQLAlchemyError as e:
-        _emit("error", ok=False, where="insert", diag=_pg_diag_payload(e))
+        result["status"] = "error"
+        result["error"] = _pg_diag_payload(e)
+        print(json.dumps(result, ensure_ascii=False, default=_json_default))
+        sys.exit(1)
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = {"type": type(e).__name__, "message": str(e)[:500]}
+        print(json.dumps(result, ensure_ascii=False, default=_json_default))
         sys.exit(1)
 
-    _emit("price_change_to_gold",
-          source_rows=int(total_src),
-          matched_by_mapping=int(total_match),
-          inserted=int(inserted),
-          target=f"{SCHEMA_GOLD}.{TGT_TABLE}")
+    print(json.dumps(result, ensure_ascii=False, default=_json_default))
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        _emit("error", ok=False, where="unhandled", error=str(e)[:500])
-        sys.exit(1)
+    main()

@@ -17,10 +17,11 @@ CFG = json.loads((PROJECT_ROOT / "config.json").read_text(encoding="utf-8"))
 DB_URL = f"postgresql+psycopg2://{CFG['USER']}:{CFG['PWD']}@{CFG['HOST']}:{CFG['PORT']}/{CFG['DB']}"
 
 SCHEMA_SILVER = "silver"
-SCHEMA_GOLD   = "gold"
+SCHEMA_GOLD = "gold"
 
-SRC_TABLE     = "seller_info_silver"
-TARGET_TABLE  = "totalized"
+SRC_TABLE = "seller_info_silver"
+TARGET_TABLE = "totalized"
+
 
 # ================= JSON utils =================
 def _json_default(o):
@@ -32,24 +33,23 @@ def _json_default(o):
     if isinstance(o, Decimal): return float(o)
     return str(o)
 
-def _emit(stage: str, **payload):
-    print(json.dumps({"stage": stage, **payload}, ensure_ascii=False, default=_json_default), flush=True)
 
 def _pg_diag_payload(exc: Exception):
     d = {"type": type(exc).__name__}
     orig = getattr(exc, "orig", None)
     if orig is not None:
-        d["pgcode"]  = getattr(orig, "pgcode", None)
+        d["pgcode"] = getattr(orig, "pgcode", None)
         d["pgerror"] = getattr(orig, "pgerror", None)
         diag = getattr(orig, "diag", None)
         if diag:
-            for k in ("schema_name","table_name","column_name","datatype_name",
-                      "constraint_name","message_primary","message_detail","context"):
+            for k in ("schema_name", "table_name", "column_name", "datatype_name",
+                      "constraint_name", "message_primary", "message_detail", "context"):
                 v = getattr(diag, k, None)
                 if v: d[k] = str(v)
     stmt = getattr(exc, "statement", None)
     if stmt: d["statement_preview"] = stmt[:300]
     return d
+
 
 # ================= DDL  =================
 
@@ -69,7 +69,6 @@ BEGIN
     RAISE EXCEPTION 'Table %.% not found. Create it before seller-enrich.', '{SCHEMA_GOLD}', '{TARGET_TABLE}';
   END IF;
 
-  -- снять старый «полный запрет», если есть
   IF EXISTS (
     SELECT 1 FROM pg_trigger t
     WHERE t.tgname = 'trg_{TARGET_TABLE}_append_only'
@@ -78,7 +77,6 @@ BEGIN
     EXECUTE format('DROP TRIGGER %I ON %I.%I', 'trg_{TARGET_TABLE}_append_only', '{SCHEMA_GOLD}', '{TARGET_TABLE}');
   END IF;
 
-  -- снять старый whitelist, если остался
   IF EXISTS (
     SELECT 1 FROM pg_trigger t
     WHERE t.tgname = 'trg_{TARGET_TABLE}_append_only_whitelist'
@@ -88,7 +86,6 @@ BEGIN
   END IF;
 END$$;
 """
-
 
 DDL_CREATE_WHITELIST_FUNC = f"""
 CREATE OR REPLACE FUNCTION {SCHEMA_GOLD}.allow_only_agent_updates() RETURNS trigger AS $FN$
@@ -134,7 +131,6 @@ END
 $FN$ LANGUAGE plpgsql;
 """
 
-
 DDL_CREATE_WHITELIST_TRIGGER = f"""
 DO $$
 DECLARE
@@ -157,6 +153,7 @@ BEGIN
 END$$;
 """
 
+
 # ================= Load & sanitize sellers =================
 def load_seller_df(conn) -> pd.DataFrame:
     df = pd.read_sql(f"""
@@ -169,8 +166,7 @@ def load_seller_df(conn) -> pd.DataFrame:
         WHERE internal_id IS NOT NULL
     """, conn)
 
-
-    for c in ("agent_name","agent_phone","agent_email"):
+    for c in ("agent_name", "agent_phone", "agent_email"):
         if c not in df.columns:
             df[c] = None
         df[c] = df[c].astype(object).apply(
@@ -178,67 +174,50 @@ def load_seller_df(conn) -> pd.DataFrame:
             else (lambda t: t if t != "" else None)(str(v).strip())
         )
 
-
     df["internal_id"] = pd.to_numeric(df["internal_id"], errors="coerce")
     df = df.dropna(subset=["internal_id"]).copy()
     df["internal_id"] = df["internal_id"].astype("int64")
 
-
     df = (
         df.sort_values(["internal_id"])
-          .groupby("internal_id", as_index=False)
-          .agg({"agent_name":"last","agent_phone":"last","agent_email":"last"})
+        .groupby("internal_id", as_index=False)
+        .agg({"agent_name": "last", "agent_phone": "last", "agent_email": "last"})
     )
 
-    _emit("seller_input_ready",
-          rows_after_clean=int(len(df)),
-          dtypes={k: str(v) for k,v in df.dtypes.items()})
     return df
+
 
 # ================= Main =================
 def main():
+    result = {
+        "status": "success",
+        "rows_fetched": 0,
+        "rows_matched": 0,
+        "rows_updated": 0,
+        "timestamp": datetime.now().isoformat()
+    }
+
     engine = create_engine(DB_URL, pool_pre_ping=True)
 
     try:
+        # DDL operations
         with engine.begin() as conn:
             conn.execute(text(DDL_DROP_OLD_TRIGGERS))
-        _emit("ddl_drop_old_triggers_ok", ok=True)
-    except SQLAlchemyError as e:
-        _emit("error", ok=False, where="ddl_drop_triggers", diag=_pg_diag_payload(e))
-        sys.exit(1)
-
-
-    try:
-        with engine.begin() as conn:
             conn.execute(text(DDL_CREATE_WHITELIST_FUNC))
-        _emit("ddl_create_whitelist_func_ok", ok=True)
-    except SQLAlchemyError as e:
-        _emit("error", ok=False, where="ddl_create_whitelist_func", diag=_pg_diag_payload(e))
-        sys.exit(1)
-
-
-    try:
-        with engine.begin() as conn:
             conn.execute(text(DDL_CREATE_WHITELIST_TRIGGER))
-        _emit("ddl_create_whitelist_trigger_ok", ok=True)
-    except SQLAlchemyError as e:
-        _emit("error", ok=False, where="ddl_create_whitelist_trigger", diag=_pg_diag_payload(e))
-        sys.exit(1)
 
-
-    try:
+        # Load sellers
         with engine.begin() as conn:
             sellers = load_seller_df(conn)
-    except SQLAlchemyError as e:
-        _emit("error", ok=False, where="load_sellers", diag=_pg_diag_payload(e))
-        sys.exit(1)
 
-    if sellers.empty:
-        _emit("no-op", seen=0, note="seller_info_silver is empty")
-        return
+        result["rows_fetched"] = len(sellers)
 
+        if sellers.empty:
+            result["status"] = "no_data"
+            print(json.dumps(result, ensure_ascii=False, default=_json_default))
+            return
 
-    try:
+        # Update gold table
         with engine.begin() as conn:
             conn.execute(text("DROP TABLE IF EXISTS tmp_seller_enrich"))
             conn.execute(text("""
@@ -250,31 +229,27 @@ def main():
                 ) ON COMMIT DROP
             """))
 
-            payload = sellers[["internal_id","agent_name","agent_phone","agent_email"]].copy()
+            payload = sellers[["internal_id", "agent_name", "agent_phone", "agent_email"]].copy()
             payload["internal_id"] = payload["internal_id"].astype("int64")
-
-            _emit("tmp_load_preview",
-                  cols=payload.columns.tolist(),
-                  dtypes={k: str(v) for k,v in payload.dtypes.items()},
-                  sample=payload.head(3).to_dict("records"))
 
             try:
                 payload.to_sql("tmp_seller_enrich", con=conn, if_exists="append",
                                index=False, method="multi", chunksize=50_000)
-            except Exception as e:
-                _emit("tmp_load_multi_failed", error=str(e)[:400])
+            except Exception:
                 payload.to_sql("tmp_seller_enrich", con=conn, if_exists="append",
                                index=False, method=None, chunksize=1000)
 
-            cnt_tmp   = conn.execute(text("SELECT COUNT(*) FROM tmp_seller_enrich")).scalar_one()
-            cnt_nullk = conn.execute(text("SELECT COUNT(*) FROM tmp_seller_enrich WHERE internal_id IS NULL")).scalar_one()
+            cnt_nullk = conn.execute(
+                text("SELECT COUNT(*) FROM tmp_seller_enrich WHERE internal_id IS NULL")).scalar_one()
             if cnt_nullk:
-                raise RuntimeError(f"tmp_seller_enrich has NULL keys: {cnt_nullk}/{cnt_tmp}")
+                raise RuntimeError(f"tmp_seller_enrich has NULL keys: {cnt_nullk}")
 
             matched = conn.execute(text(f"""
                 SELECT COUNT(*) FROM {SCHEMA_GOLD}.{TARGET_TABLE} t
                 JOIN tmp_seller_enrich s USING (internal_id)
             """)).scalar_one()
+
+            result["rows_matched"] = matched
 
             updated = conn.execute(text(f"""
                 WITH src AS (
@@ -297,21 +272,22 @@ def main():
                        t.agent_email IS DISTINCT FROM src.agent_email
                   );
             """)).rowcount
+
+            result["rows_updated"] = updated
+
     except SQLAlchemyError as e:
-        _emit("error", ok=False, where="update_totalized", diag=_pg_diag_payload(e))
+        result["status"] = "error"
+        result["error"] = _pg_diag_payload(e)
+        print(json.dumps(result, ensure_ascii=False, default=_json_default))
         sys.exit(1)
     except Exception as e:
-        _emit("error", ok=False, where="update_totalized", error=str(e)[:500])
+        result["status"] = "error"
+        result["error"] = {"type": type(e).__name__, "message": str(e)[:500]}
+        print(json.dumps(result, ensure_ascii=False, default=_json_default))
         sys.exit(1)
 
-    _emit("seller_enriched",
-          seen=int(len(sellers)),
-          matched_in_totalized=int(matched),
-          updated_rows=int(updated))
+    print(json.dumps(result, ensure_ascii=False, default=_json_default))
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        _emit("error", ok=False, where="unhandled", error=str(e)[:500])
-        sys.exit(1)
+    main()

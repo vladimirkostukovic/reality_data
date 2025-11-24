@@ -1,3 +1,8 @@
+#  Syncs real estate listings from silver.summarized_geo to gold.totalized:
+#  Deduplicates using Union-Find on image_duplicate_clean pairs
+#  Assigns stable object_id to each canonical group via object_id_map
+#  Inserts only new internal_id records (append-only), filtering by valid Czech regions
+
 from __future__ import annotations
 
 import json
@@ -169,11 +174,6 @@ def _pg_diag_payload(exc: Exception):
     return d
 
 
-def _emit(stage: str, **payload):
-    msg = {"stage": stage, **payload}
-    print(json.dumps(msg, ensure_ascii=False, default=_json_default), flush=True)
-
-
 # ================= Union-Find =================
 class UF:
     __slots__ = ("p", "r")
@@ -247,7 +247,6 @@ def groups_from_clean(conn, all_iids: pd.Series) -> pd.DataFrame:
     ids = set(map(int, all_iids.astype("int64").tolist()))
 
     if dup.empty:
-        # нет дубликатов -> каждая internal_id сама себе canonical
         return pd.DataFrame(
             {
                 "internal_id": list(ids),
@@ -330,7 +329,6 @@ def upsert_new_objmap(conn, need_ids: List[int], existing: pd.DataFrame) -> pd.D
         chunksize=100_000,
     )
 
-
     conn.execute(
         text(
             f"""
@@ -346,119 +344,46 @@ def upsert_new_objmap(conn, need_ids: List[int], existing: pd.DataFrame) -> pd.D
     return load_objmap(conn)
 
 
-def _brief(df: pd.DataFrame):
-    info = []
-    for c in df.columns:
-        s = df[c]
-        rec = {
-            "col": c,
-            "dtype": str(s.dtype),
-            "not_null": int(s.notna().sum()),
-            "nulls": int(s.isna().sum()),
-        }
-        if c in ("added_date", "archived_date"):
-            try:
-                dt = pd.to_datetime(s, errors="coerce")
-                rec["min"] = None if dt.dropna().empty else str(dt.min())
-                rec["max"] = None if dt.dropna().empty else str(dt.max())
-            except Exception:
-                rec["min"] = rec["max"] = None
-        info.append(rec)
-    return info
-
-
-def debug_insert_out(df: pd.DataFrame, engine, schema: str, table: str):
-    t0 = time.time()
-
-    df.to_sql(
-        table,
-        con=engine,
-        schema=schema,
-        if_exists='append',
-        index=False,
-        method='multi',
-        chunksize=10000
-    )
-
-    _emit(
-        "insert_ok",
-        ok=True,
-        rows=int(len(df)),
-        took_ms=int((time.time() - t0) * 1000)
-    )
-
-
 # ================= Main =================
 def main():
-    start_ts = time.time()
-    _emit("start", ok=True)
+    result = {
+        "status": "success",
+        "rows_fetched": 0,
+        "rows_filtered": 0,
+        "new_object_ids": 0,
+        "rows_inserted": 0,
+        "timestamp": datetime.now().isoformat()
+    }
 
     engine = create_engine(DB_URL, pool_pre_ping=True)
 
-    t0 = time.time()
     try:
+        # DDL
         with engine.begin() as conn:
             conn.execute(text(DDL))
-        _emit("ddl_ok", ok=True, took_ms=int((time.time() - t0) * 1000))
-    except SQLAlchemyError as e:
-        _emit("error", ok=False, where="ddl", diag=_pg_diag_payload(e))
-        sys.exit(1)
 
-
-    try:
+        # Read and process data
         with engine.begin() as conn:
-            t1 = time.time()
             facts = latest_summary(conn)
-            _emit(
-                "read_facts_ok",
-                ok=True,
-                rows=int(len(facts)),
-                took_ms=int((time.time() - t1) * 1000),
-            )
+            result["rows_fetched"] = len(facts)
 
-
+            # Filter by valid districts
             before_cut = len(facts)
-            facts = facts[
-                facts["norm_district"].isin(VALID_DISTRICTS)
-            ].copy()
+            facts = facts[facts["norm_district"].isin(VALID_DISTRICTS)].copy()
             after_cut = len(facts)
-
-            _emit(
-                "region_filter",
-                ok=True,
-                kept_rows=after_cut,
-                dropped_rows=before_cut - after_cut,
-                distinct_regions=sorted(
-                    facts["norm_district"]
-                    .dropna()
-                    .unique()
-                    .tolist()
-                ),
-            )
+            result["rows_filtered"] = after_cut
 
             if facts.empty:
-                _emit(
-                    "done",
-                    ok=True,
-                    seen=0,
-                    new_groups=0,
-                    inserted=0,
-                    note="summarized_geo empty or filtered out by region",
-                    took_ms=int((time.time() - start_ts) * 1000),
-                )
+                result["status"] = "no_data"
+                print(json.dumps(result, ensure_ascii=False, default=_json_default))
                 return
 
             iids = facts["internal_id"].astype("int64")
 
-            t2 = time.time()
+            # Build groups
             groups = groups_from_clean(conn, iids)
-            _emit(
-                "groups_ok",
-                ok=True,
-                rows=int(len(groups)),
-                took_ms=int((time.time() - t2) * 1000),
-            )
 
+            # Load object map
             objmap = load_objmap(conn)
             known = (
                 set(objmap["canonical_internal_id"].astype("int64"))
@@ -468,38 +393,21 @@ def main():
             need = sorted(
                 set(groups["canonical_internal_id"].astype("int64")) - known
             )
-            _emit("objmap_need", ok=True, need=len(need))
-    except SQLAlchemyError as e:
-        _emit("error", ok=False, where="read_inputs", diag=_pg_diag_payload(e))
-        sys.exit(1)
+            result["new_object_ids"] = len(need)
 
-
-    if need:
-        try:
-            t3 = time.time()
+        # Upsert new object IDs if needed
+        if need:
             with engine.begin() as conn:
                 objmap = upsert_new_objmap(conn, need, objmap)
-            _emit(
-                "objmap_upsert_ok",
-                ok=True,
-                new_ids=len(need),
-                took_ms=int((time.time() - t3) * 1000),
-            )
-        except SQLAlchemyError as e:
-            _emit("error", ok=False, where="objmap_upsert", diag=_pg_diag_payload(e))
-            sys.exit(1)
 
-
-    try:
+        # Prepare and insert data
         with engine.begin() as conn:
             objmap = load_objmap(conn)
-
 
             to_ins = (
                 facts.merge(groups, on="internal_id", how="left")
                 .merge(objmap, on="canonical_internal_id", how="left")
             )
-
 
             to_ins["object_id"] = (
                 to_ins["object_id"]
@@ -507,7 +415,7 @@ def main():
                 .astype("int64")
             )
 
-
+            # Filter out existing records
             try:
                 existing = pd.read_sql(
                     f"""
@@ -525,152 +433,129 @@ def main():
             ].copy()
 
             if to_ins.empty:
-                _emit(
-                    "no_new",
-                    ok=True,
-                    seen=int(len(facts)),
-                    new_groups=int(len(need)),
-                    inserted=0,
-                    note="no new internal_id to append",
-                )
-                _emit(
-                    "done",
-                    ok=True,
-                    seen=int(len(facts)),
-                    new_groups=int(len(need)),
-                    inserted=0,
-                    took_ms=int((time.time() - start_ts) * 1000),
-                )
+                result["status"] = "no_new_data"
+                print(json.dumps(result, ensure_ascii=False, default=_json_default))
                 return
-    except SQLAlchemyError as e:
-        _emit("error", ok=False, where="prepare", diag=_pg_diag_payload(e))
-        sys.exit(1)
 
+        # Prepare columns
+        for c in ["agent_name", "agent_phone", "agent_email"]:
+            if c not in to_ins.columns:
+                to_ins[c] = None
 
-    for c in ["agent_name", "agent_phone", "agent_email"]:
-        if c not in to_ins.columns:
-            to_ins[c] = None
+        out = to_ins.reindex(
+            columns=[
+                "object_id",
+                "internal_id",
+                "added_date",
+                "available",
+                "archived_date",
+                "source_id",
+                "category_value",
+                "category_name",
+                "name",
+                "deal_type",
+                "deal_type_value",
+                "price",
+                "rooms",
+                "area_build",
+                "longitude",
+                "latitude",
+                "norm_district",
+                "norm_city",
+                "norm_city_part",
+                "norm_street",
+                "norm_house_number",
+                "area_land",
+                "norm_okres",
+                "agent_name",
+                "agent_phone",
+                "agent_email",
+            ]
+        ).copy()
 
-    out = to_ins.reindex(
-        columns=[
-            "object_id",
-            "internal_id",
-            "added_date",
-            "available",
-            "archived_date",
+        # Type conversions
+        int_cols = ["object_id", "internal_id", "category_value", "deal_type_value"]
+        for c in int_cols:
+            out[c] = (
+                pd.to_numeric(out[c], errors="coerce")
+                .apply(lambda v: None if pd.isna(v) else int(v))
+            )
+
+        float_cols = ["price", "area_build", "longitude", "latitude", "area_land"]
+        for c in float_cols:
+            out[c] = (
+                pd.to_numeric(out[c], errors="coerce")
+                .apply(lambda v: None if pd.isna(v) else float(v))
+            )
+
+        def _to_bool(v):
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return None
+            if isinstance(v, (bool, np.bool_)):
+                return bool(v)
+            s = str(v).strip().lower()
+            if s in ("1", "true", "t", "yes", "y"):
+                return True
+            if s in ("0", "false", "f", "no", "n", ""):
+                return False
+            return None
+
+        out["available"] = out["available"].apply(_to_bool)
+
+        for c in ["added_date", "archived_date"]:
+            dt = pd.to_datetime(out[c], errors="coerce").dt.date
+            out[c] = dt.where(~pd.isna(dt), None)
+
+        TEXT_COLS = [
             "source_id",
-            "category_value",
             "category_name",
             "name",
             "deal_type",
-            "deal_type_value",
-            "price",
             "rooms",
-            "area_build",
-            "longitude",
-            "latitude",
             "norm_district",
             "norm_city",
             "norm_city_part",
             "norm_street",
             "norm_house_number",
-            "area_land",
             "norm_okres",
             "agent_name",
             "agent_phone",
             "agent_email",
         ]
-    ).copy()
+        for c in TEXT_COLS:
+            s = out[c]
+            out[c] = s.apply(
+                lambda v: None
+                if (v is None or (isinstance(v, float) and pd.isna(v)))
+                else (str(v).strip() or None)
+            )
 
-
-    int_cols = ["object_id", "internal_id", "category_value", "deal_type_value"]
-    for c in int_cols:
-        out[c] = (
-            pd.to_numeric(out[c], errors="coerce")
-            .apply(lambda v: None if pd.isna(v) else int(v))
+        # Insert
+        out.to_sql(
+            T_TARGET,
+            con=engine,
+            schema=SCHEMA_GOLD,
+            if_exists='append',
+            index=False,
+            method='multi',
+            chunksize=10000
         )
 
-    float_cols = ["price", "area_build", "longitude", "latitude", "area_land"]
-    for c in float_cols:
-        out[c] = (
-            pd.to_numeric(out[c], errors="coerce")
-            .apply(lambda v: None if pd.isna(v) else float(v))
-        )
+        result["rows_inserted"] = len(out)
 
-    def _to_bool(v):
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return None
-        if isinstance(v, (bool, np.bool_)):
-            return bool(v)
-        s = str(v).strip().lower()
-        if s in ("1", "true", "t", "yes", "y"):
-            return True
-        if s in ("0", "false", "f", "no", "n", ""):
-            return False
-        return None
-
-    out["available"] = out["available"].apply(_to_bool)
-
-
-    for c in ["added_date", "archived_date"]:
-        dt = pd.to_datetime(out[c], errors="coerce").dt.date
-        out[c] = dt.where(~pd.isna(dt), None)
-
-
-    TEXT_COLS = [
-        "source_id",
-        "category_name",
-        "name",
-        "deal_type",
-        "rooms",
-        "norm_district",
-        "norm_city",
-        "norm_city_part",
-        "norm_street",
-        "norm_house_number",
-        "norm_okres",
-        "agent_name",
-        "agent_phone",
-        "agent_email",
-    ]
-    for c in TEXT_COLS:
-        s = out[c]
-        out[c] = s.apply(
-            lambda v: None
-            if (v is None or (isinstance(v, float) and pd.isna(v)))
-            else (str(v).strip() or None)
-        )
-
-    _emit(
-        "pre_insert",
-        ok=True,
-        rows=int(len(out)),
-        cols=list(out.columns),
-        sample=out.head(3).to_dict(orient="records"),
-        summary=_brief(out),
-    )
-
-
-    try:
-        debug_insert_out(out, engine, SCHEMA_GOLD, T_TARGET)
+    except SQLAlchemyError as e:
+        result["status"] = "error"
+        result["error"] = _pg_diag_payload(e)
+        print(json.dumps(result, ensure_ascii=False, default=_json_default))
+        sys.exit(1)
     except Exception as e:
-        _emit("error", ok=False, where="insert", diag=_pg_diag_payload(e))
+        result["status"] = "error"
+        result["error"] = {"type": type(e).__name__, "message": str(e)[:500]}
+        print(json.dumps(result, ensure_ascii=False, default=_json_default))
         sys.exit(1)
 
-    _emit(
-        "done",
-        ok=True,
-        seen=int(len(facts)),
-        new_groups=int(len(need)),
-        inserted=int(len(out)),
-        target=f"{SCHEMA_GOLD}.{T_TARGET}",
-        took_ms=int((time.time() - start_ts) * 1000),
-    )
+    print(json.dumps(result, ensure_ascii=False, default=_json_default))
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        _emit("error", ok=False, where="unhandled", error=str(e)[:500])
-        sys.exit(1)
+    main()
