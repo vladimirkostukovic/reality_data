@@ -42,25 +42,25 @@ MODULES = {
     "photo_modul": {
         "enabled": False,
         "steps": [
-            "wrapper_photo_modul.py",
+            "photo_modul/wrapper_photo_modul.py",
         ],
     },
     "geo": {
         "enabled": True,
         "steps": [
-            "wrapper_geo.py",
+            "geo_modul/wrapper_geo.py",
         ],
     },
     "cluster": {
         "enabled": True,
         "steps": [
-            "wrapper_cluster.py",
+            "photo_cluster_builder/wrapper_cluster.py",
         ],
     },
     "audit": {
         "enabled": True,
         "steps": [
-            "wrapper_audit.py",
+            "audit/wrapper_audit.py",
         ],
     },
 }
@@ -68,36 +68,37 @@ MODULES = {
 # ========================================================
 
 def extract_last_json(stdout: str) -> Optional[Dict[str, Any]]:
-    """Robustly extracts last valid JSON block from stdout."""
     if not stdout:
         return None
 
-    # try whole stdout first
-    s = stdout.strip()
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
+    buf = ""
+    depth = 0
+    capturing = False
+    last_valid = None
 
-    # try line-by-line backwards
-    for line in reversed(s.splitlines()):
-        t = line.strip()
-        if t.startswith("{") and t.endswith("}"):
-            try:
-                return json.loads(t)
-            except Exception:
-                continue
+    for ch in stdout:
+        if ch == "{":
+            if not capturing:
+                capturing = True
+                buf = ""
+                depth = 0
+            depth += 1
 
-    # final fallback — take last "{" and try from there
-    last_open = s.rfind("{")
-    if last_open != -1:
-        cand = s[last_open:]
-        try:
-            return json.loads(cand)
-        except Exception:
-            pass
+        if capturing:
+            buf += ch
 
-    return None
+        if ch == "}":
+            if capturing:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        last_valid = json.loads(buf)
+                    except Exception:
+                        pass
+                    capturing = False
+                    buf = ""
+
+    return last_valid
 
 
 def run_step(step: str) -> Dict[str, Any]:

@@ -21,7 +21,6 @@ STEPS = [
 # -------- HELPERS --------
 
 def run_step(path: Path):
-    """Run one geo step, return dict with explicit file + stage."""
     t0 = time.time()
 
     try:
